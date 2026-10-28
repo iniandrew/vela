@@ -78,6 +78,7 @@ php_install() { # ver
   for e in pdo_sqlite pdo_mysql pdo_pgsql intl gd zip bcmath sodium openssl mbstring; do
     grep -qix "$e" <<<"$m" || warn "PHP $v lacks extension: $e"
   done
+  local f; for f in "$CONF"/services/redis-*.env; do php_ext_install redis "$v" || true; break; done
 }
 write_fpm_conf() { # ver
   mkdir -p "$CONF/fpm" "$RUN"
@@ -377,6 +378,25 @@ cmd_sites() {
 }
 cmd_links() { local l; for l in "$CONF"/links/*; do printf '%s -> %s\n' "${l##*/}" "$(readlink "$l")"; done; }
 cmd_open() { local n; n=$(site_arg "${1:-}"); local s=http; [[ -e $CONF/secure/$n ]] && s=https; xdg-open "$s://$n.$TLD"; }
+
+# ---- PECL extensions (phpredis for the Redis addon) ------------------------
+php_ext_install() { # ext ver -> installs via pecl and enables it in conf.d/<ext>.ini
+  local ext=$1 v=$2 p; p=$(php_prefix "$v")
+  [[ -n $p ]] || { warn "PHP $v is not installed"; return 1; }
+  if "$p/bin/php" -m | grep -qix "$ext"; then return 0; fi
+  say "installing PECL $ext for PHP $v"
+  printf '\n\n\n\n\n\n\n\n' | "$p/bin/pecl" install "$ext" || { warn "pecl install $ext failed for PHP $v"; return 1; }
+  printf 'extension=%s\n' "$ext" >"$p/conf.d/$ext.ini"
+  "$p/bin/php" -m | grep -qix "$ext" || { warn "$ext built but is not loading for PHP $v"; return 1; }
+  sc try-restart "vela-fpm@$v" 2>/dev/null || true
+  say "$ext enabled for PHP $v"
+}
+php_redis_all() { # phpredis for every installed PHP (Laravel's default Redis client)
+  local v
+  for v in $(mise ls php 2>/dev/null | awk '$1=="php"{split($2,a,"."); print a[1]"."a[2]}' | sort -u); do
+    php_ext_install redis "$v" || true
+  done
+}
 
 # ---- xdebug ----------------------------------------------------------------
 cmd_xdebug_install() {
@@ -730,6 +750,7 @@ cmd_svc_add() {
     fi
   fi
   sc enable --now "vela-svc@$id"
+  if [[ $svc == redis ]]; then php_redis_all; fi
   say "$id running on 127.0.0.1:$port ($via). $(svc_creds "$svc" "$DB_USER" "$DB_PASS")"
 }
 cmd_svc_list() {
@@ -1220,7 +1241,7 @@ vela: Herd-like Laravel dev environment (nginx + php-fpm + .test DNS, versions v
 sites     park [dir] | forget [dir] | parked | link [name] [--secure] | unlink [name] | links
           sites | secure [name] | unsecure [name] | isolate <ver> [--site=n] | unisolate [--site=n]
           use <ver> | open [name]
-php       php:install <ver> | php:list (warns on CVE-affected versions) | xdebug:install [ver] | xdebug:remove [ver]
+php       php:install <ver> | php:list (warns on CVE-affected versions) | php:ext <ext> [ver] | xdebug:install [ver] | xdebug:remove [ver]
 addons    service:available | service:add <svc> [ver] [--via native|podman|docker] [--port N] [--user U] [--password P]
           service:list | service:default <id> | service:start|stop|restart <id> | service:remove <id> [--purge] | service:logs <id>
 lifecycle install [--deps-only] [--php=8.5,8.4] [--node=ask|lts|skip] [--xdebug=ask|yes|no] [--addons=ask|none|svc@ver[:via],...] [--yes]
@@ -1253,6 +1274,7 @@ main() {
          mise use -g "php@$1"; cmd_regen ;;
     php:install) php_install "${1:?usage: vela php:install <ver>}"; cmd_regen ;;
     php:list) mise ls php; php_cve_scan ;;
+    php:ext) php_ext_install "${1:?usage: vela php:ext <ext> [ver]}" "${2:-$(global_php)}" ;;
     xdebug:install) cmd_xdebug_install "$@" ;;  xdebug:remove) cmd_xdebug_remove "$@" ;;
     service:available) cmd_svc_available ;;
     service:add) if (( $# )); then cmd_svc_add "$@"; else pick_addons || die "the picker needs a terminal; usage: vela service:add <svc> [ver]"; fi ;;  service:default|service:link) svc_expose "${1:?usage: vela service:default <id>}" ;;
