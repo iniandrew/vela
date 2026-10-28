@@ -109,11 +109,14 @@ vela use 8.4                    # change the global default
 vela isolate 8.3                # this site only (run inside the project)
 vela isolate 8.3 --site=shop    # or name the site
 vela unisolate
+vela php:ext redis [ver]        # install and enable a PECL extension (defaults to the global PHP)
 ```
 
 `vela isolate` writes a `mise.local.toml` in the project, so `php`, `composer` and `artisan` in that folder use the same version as the web server. Consider adding `mise.local.toml` to your `.gitignore`. mise config files must be trusted: if mise asks, run `mise trust`.
 
 **Security note.** PHP 8.2.34 and older 8.2, 8.3.35 and older, 8.4.26 and older, and 8.5.11 and older are affected by CVE-2026-109618 and CVE-2026-109619 ("PHP2Shell"): unauthenticated remote code execution, reported as actively exploited. The fixed releases are 8.2.35, 8.3.36, 8.4.27 and 8.5.12. PHP 8.1 and older have no upstream fix. vela warns and asks before installing an affected version, and `vela php:list` flags ones you already have.
+
+**Extensions.** Builds include the common Laravel extensions (list below). For anything else, `vela php:ext <name> [ver]` builds it through PECL, writes `conf.d/<name>.ini` and restarts that version's PHP-FPM. It does nothing if the extension is already loaded. There is no `php.ini` to edit: extensions are enabled by `.ini` files in the PHP version's `conf.d` directory (`$(mise where php@8.5)/conf.d`), and you can put your own settings there too.
 
 Installed PHP builds include: bcmath, curl, gd, intl, mbstring, mysqli and pdo_mysql, pdo_pgsql, pdo_sqlite, sodium, openssl, zip, xsl, gmp, bz2, soap, sockets, pcntl and opcache, plus composer.
 
@@ -185,6 +188,8 @@ vela service:logs <id>
 vela service:default <id>               # which version owns psql, redis-cli, mysql ...
 vela service:remove <id> [--purge]      # --purge also deletes the data
 ```
+
+**Redis and PHP.** Laravel's default Redis client is phpredis, which PHP does not ship with. Adding a Redis addon builds the `redis` extension for every installed PHP version automatically, and any PHP you install later gets it too while a Redis addon exists. You do not need to do anything.
 
 After each native install vela asks whether to make that version the default. The default owns the client tools on your PATH: `psql`, `pg_dump`, `pg_restore`, `createdb`, `dropdb`, `redis-cli`, `mysql`, `mysqldump`, `mariadb` and friends. Server programs such as `postgres` are not on your PATH on purpose; vela runs them for you. If you try one directly, mise prints `No version is set for shim`; that is expected.
 
@@ -260,6 +265,8 @@ vela service:logs <id>
 **One project shows up as many sites (`app.test`, `config.test`, ...).** You ran `vela park` inside the project. Run `vela forget` there, then `vela link`.
 
 **The wrong PHP version is used.** `vela sites` shows the version per site. Set one with `vela isolate <ver>`, or change the default with `vela use <ver>`. A version recorded in a project's mise config that is not installed falls back to the global version.
+
+**`Class "Redis" not found`.** The phpredis extension is missing for the PHP version that site uses. Run `vela php:ext redis <ver>` (see `vela sites` for the version), then reload the page.
 
 **A site returns 502.** PHP-FPM for that version is down: `vela status`, then `journalctl --user -u 'vela-fpm@*'`.
 
