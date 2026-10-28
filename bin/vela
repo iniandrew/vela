@@ -1,0 +1,1254 @@
+#!/usr/bin/env bash
+# vela: Herd-like Laravel dev environment for Linux.
+# nginx + php-fpm + dnsmasq (.test), versions via mise, addons as systemd user services.
+set -euo pipefail
+shopt -s nullglob
+
+export PATH="$HOME/.local/bin:$PATH"
+CFG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+CONF=$CFG_HOME/vela
+DATA=${XDG_DATA_HOME:-$HOME/.local/share}/vela
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/vela
+UNITS=$CFG_HOME/systemd/user
+RUN=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vela
+TLD="test"
+DNS_PORT=5300
+YES=${VELA_YES:-0}
+PHP_EXTRA_CONFIGURE_OPTIONS=${PHP_EXTRA_CONFIGURE_OPTIONS:---with-sodium --with-jpeg --with-freetype --with-webp --with-gmp --with-bz2 --with-xsl}
+export PHP_EXTRA_CONFIGURE_OPTIONS
+
+say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mwarn:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+sc()   { systemctl --user "$@"; }
+
+TMPS=()
+trap 'for t in "${TMPS[@]:-}"; do [[ -n $t ]] && rm -rf "$t"; done' EXIT
+
+# ---- prompts (read /dev/tty so they work under `curl | bash`) -----------------
+tty_read() { # prompt -> REPLY; returns 1 when there is no tty or --yes
+  (( YES )) && return 1
+  { printf '%s' "$1" >/dev/tty; read -r REPLY </dev/tty; } 2>/dev/null
+}
+ask() { # prompt default(y|n)
+  local hint="[y/N]"; [[ $2 == y ]] && hint="[Y/n]"
+  tty_read "$1 $hint " || { [[ $2 == y ]]; return; }
+  case ${REPLY,,} in y|yes) return 0 ;; n|no) return 1 ;; *) [[ $2 == y ]] ;; esac
+}
+
+# ---- lookups ---------------------------------------------------------------
+find_bin() { # name: PATH first, then sbin dirs (Debian/Fedora keep nginx/dnsmasq there)
+  local p
+  if p=$(command -v "$1" 2>/dev/null); then echo "$p"; return 0; fi
+  for p in /usr/sbin /usr/local/sbin /sbin; do [[ -x $p/$1 ]] && { echo "$p/$1"; return 0; }; done
+  return 1
+}
+bin_of() { # prefix name: locate an executable inside an unpacked tool
+  local p=$1 n=$2 c
+  for c in "$p/bin/$n" "$p/sbin/$n" "$p/scripts/$n" "$p/$n"; do [[ -x $c ]] && { echo "$c"; return 0; }; done
+  c=$(find "$p" -maxdepth 3 -name "$n" -type f -perm -u+x 2>/dev/null | head -n1)
+  [[ -n $c ]] && { echo "$c"; return 0; }
+  return 1
+}
+mkc() { # mkcert, wherever it lives (mise global, or PATH)
+  local b; b=$(mise which mkcert 2>/dev/null || command -v mkcert) || die "mkcert not found (run: vela install)"
+  "$b" "$@"
+}
+
+# ---- PHP -------------------------------------------------------------------
+php_prefix() { mise where "php@$1" 2>/dev/null || true; }
+global_php() {
+  local v; v=$(cd "$HOME" && mise current php 2>/dev/null </dev/null | awk '{print $1}') || v=""
+  echo "${v%.*}"
+}
+site_php() { # path -> major.minor of the PHP that site should use
+  local v; v=$(cd "$1" 2>/dev/null && mise current php 2>/dev/null </dev/null | awk '{print $1}') || v=""
+  v=${v%.*}
+  if [[ $v =~ ^[0-9]+\.[0-9]+$ && -n $(php_prefix "$v") ]]; then echo "$v"; else global_php; fi
+}
+php_install() { # ver
+  local v=$1
+  php_cve_confirm "$v" || { warn "skipped PHP $v"; return 1; }
+  say "compiling PHP $v with mise (5-10 min)"
+  mise install "php@$v"
+  local p; p=$(php_prefix "$v")
+  [[ -x $p/sbin/php-fpm ]] || die "php-fpm missing in $p"
+  local m; m=$("$p/bin/php" -m)
+  for e in pdo_sqlite pdo_mysql pdo_pgsql intl gd zip bcmath sodium openssl mbstring; do
+    grep -qix "$e" <<<"$m" || warn "PHP $v lacks extension: $e"
+  done
+}
+write_fpm_conf() { # ver
+  mkdir -p "$CONF/fpm" "$RUN"
+  cat >"$CONF/fpm/$1.conf" <<EOF
+[global]
+pid = $RUN/php-$1.pid
+error_log = syslog
+syslog.ident = vela-php-fpm
+daemonize = no
+[www]
+listen = $RUN/php-$1.sock
+pm = ondemand
+pm.max_children = 20
+pm.process_idle_timeout = 20s
+catch_workers_output = yes
+decorate_workers_output = no
+clear_env = no
+EOF
+}
+fpm_run() { # ver (called by systemd)
+  local p; p=$(php_prefix "$1")
+  [[ -n $p && -x $p/sbin/php-fpm ]] || die "PHP $1 is not installed"
+  write_fpm_conf "$1"
+  exec "$p/sbin/php-fpm" --nodaemonize --fpm-config "$CONF/fpm/$1.conf"
+}
+
+# ---- sites -----------------------------------------------------------------
+declare -A SITE_PATH=()
+site_slug() { # dirname -> hostname label, or fail
+  local s=${1,,}
+  s=${s#www.}
+  [[ $s =~ ^[a-z0-9][a-z0-9._-]*$ ]] || return 1
+  echo "$s"
+}
+parked_dirs() { [[ -f $CONF/parked ]] && cat "$CONF/parked" || true; }
+load_sites() {
+  SITE_PATH=()
+  local d p n l
+  while IFS= read -r d; do
+    [[ -n $d && -d $d ]] || continue
+    for p in "$d"/*/; do
+      p=${p%/}
+      n=$(site_slug "${p##*/}") || continue
+      SITE_PATH[$n]=$p
+    done
+  done < <(parked_dirs)
+  for l in "$CONF"/links/*; do
+    [[ -L $l ]] || continue
+    p=$(readlink -f "$l")
+    [[ -d $p ]] && SITE_PATH[${l##*/}]=$p
+  done
+}
+site_arg() { # optional name arg -> slug; default is the current dir
+  local n=${1:-}
+  if [[ -z $n ]]; then
+    local d; d=$(readlink -f "$PWD")
+    load_sites
+    for n in "${!SITE_PATH[@]}"; do [[ ${SITE_PATH[$n]} == "$d" ]] && { echo "$n"; return; }; done
+    n=${d##*/}
+  fi
+  site_slug "$n" || die "invalid site name: $n"
+}
+require_site() { load_sites; [[ -n ${SITE_PATH[$1]:-} ]] || die "no such site: $1 (see: vela sites)"; }
+ensure_cert() { # name
+  local n=$1
+  [[ -f $CONF/certs/$n.pem && -f $CONF/certs/$n-key.pem ]] && return 0
+  mkdir -p "$CONF/certs"
+  mkc -cert-file "$CONF/certs/$n.pem" -key-file "$CONF/certs/$n-key.pem" "$n.$TLD" "*.$n.$TLD" >/dev/null
+}
+
+write_fastcgi_params() {
+  cat >"$CONF/nginx/fastcgi_params" <<'EOF'
+fastcgi_param QUERY_STRING       $query_string;
+fastcgi_param REQUEST_METHOD     $request_method;
+fastcgi_param CONTENT_TYPE       $content_type;
+fastcgi_param CONTENT_LENGTH     $content_length;
+fastcgi_param SCRIPT_NAME        $fastcgi_script_name;
+fastcgi_param REQUEST_URI        $request_uri;
+fastcgi_param DOCUMENT_URI       $document_uri;
+fastcgi_param DOCUMENT_ROOT      $document_root;
+fastcgi_param SERVER_PROTOCOL    $server_protocol;
+fastcgi_param REQUEST_SCHEME     $scheme;
+fastcgi_param HTTPS              $https if_not_empty;
+fastcgi_param GATEWAY_INTERFACE  CGI/1.1;
+fastcgi_param SERVER_SOFTWARE    nginx/$nginx_version;
+fastcgi_param REMOTE_ADDR        $remote_addr;
+fastcgi_param REMOTE_PORT        $remote_port;
+fastcgi_param SERVER_ADDR        $server_addr;
+fastcgi_param SERVER_PORT        $server_port;
+fastcgi_param SERVER_NAME        $server_name;
+fastcgi_param REDIRECT_STATUS    200;
+EOF
+}
+render_nginx_conf() { # dir holding sites/
+  local mime=""
+  for m in /etc/nginx/mime.types /usr/share/nginx/mime.types /usr/local/etc/nginx/mime.types; do
+    [[ -f $m ]] && { mime="include $m;"; break; }
+  done
+  cat <<EOF
+worker_processes auto;
+pid $RUN/nginx.pid;
+error_log stderr warn;
+events { worker_connections 1024; }
+http {
+  $mime
+  default_type application/octet-stream;
+  access_log off;
+  sendfile on;
+  keepalive_timeout 65;
+  server_names_hash_bucket_size 128;
+  client_max_body_size 512m;
+  large_client_header_buffers 4 32k;
+  client_body_temp_path $STATE/nginx/body;
+  proxy_temp_path $STATE/nginx/proxy;
+  fastcgi_temp_path $STATE/nginx/fastcgi;
+  uwsgi_temp_path $STATE/nginx/uwsgi;
+  scgi_temp_path $STATE/nginx/scgi;
+  include $1/sites/*.conf;
+}
+EOF
+}
+render_default() {
+  cat <<'EOF'
+server {
+  listen 127.0.0.1:80 default_server;
+  listen 127.0.0.1:443 ssl default_server;
+  ssl_reject_handshake on;
+  server_name _;
+  return 404;
+}
+EOF
+}
+render_site() { # name root sock secure
+  local n=$1 root=$2 sock=$3 sec=$4 names="$1.$TLD *.$1.$TLD" body
+  body=$(cat <<EOF
+  root "$root";
+  index index.php index.html;
+  charset utf-8;
+  location / { try_files \$uri \$uri/ /index.php?\$query_string; }
+  location = /favicon.ico { access_log off; log_not_found off; }
+  location = /robots.txt  { access_log off; log_not_found off; }
+  error_page 404 /index.php;
+  location ~ \.php\$ {
+    fastcgi_pass unix:$sock;
+    fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
+    include $CONF/nginx/fastcgi_params;
+    fastcgi_read_timeout 300;
+    fastcgi_hide_header X-Powered-By;
+  }
+  location ~ /\.(?!well-known) { deny all; }
+EOF
+)
+  if [[ $sec == 1 ]]; then
+    cat <<EOF
+server { listen 127.0.0.1:80; server_name $names; return 301 https://\$host\$request_uri; }
+server {
+  listen 127.0.0.1:443 ssl;
+  server_name $names;
+  ssl_certificate $CONF/certs/$n.pem;
+  ssl_certificate_key $CONF/certs/$n-key.pem;
+  ssl_protocols TLSv1.2 TLSv1.3;
+$body
+}
+EOF
+  else
+    printf 'server {\n  listen 127.0.0.1:80;\n  server_name %s;\n%s\n}\n' "$names" "$body"
+  fi
+}
+render_path_unit() {
+  local d n
+  printf '[Unit]\nDescription=vela site watcher\nStartLimitIntervalSec=0\n\n[Path]\nUnit=vela-sites.service\n'
+  while IFS= read -r d; do [[ -n $d ]] && printf 'PathChanged=%s\n' "$d"; done < <(parked_dirs)
+  for n in "${!SITE_PATH[@]}"; do printf 'PathChanged=%s\n' "${SITE_PATH[$n]}"; done | sort -u
+  printf '\n[Install]\nWantedBy=vela.target\n'
+}
+
+cmd_regen() {
+  local quiet=0; [[ ${1:-} == --quiet ]] && quiet=1
+  mkdir -p "$CONF"/{nginx/sites,certs,links,secure,fpm,services} "$STATE/nginx"/{body,proxy,fastcgi,uwsgi,scgi} "$RUN" "$UNITS"
+  exec 9>"$STATE/regen.lock"; flock 9
+  local ng; ng=$(find_bin nginx) || die "nginx is not installed"
+  local gv; gv=$(global_php)
+  [[ -n $gv ]] || die "no PHP installed. Run: vela php:install 8.5"
+  local tmp; tmp=$(mktemp -d "$STATE/gen.XXXXXX"); TMPS+=("$tmp")
+  mkdir -p "$tmp/sites"
+  load_sites
+  declare -A used=(["$gv"]=1)
+  local n p v sec root
+  while IFS= read -r n; do
+    [[ -n $n ]] || continue
+    p=${SITE_PATH[$n]}
+    v=$(site_php "$p"); used[$v]=1
+    sec=0; [[ -e $CONF/secure/$n ]] && sec=1
+    if (( sec )) && ! ensure_cert "$n"; then warn "certificate for $n failed; serving http"; sec=0; fi
+    root=$p; [[ -d $p/public ]] && root=$p/public
+    render_site "$n" "$root" "$RUN/php-$v.sock" "$sec" >"$tmp/sites/$n.conf"
+  done < <(printf '%s\n' "${!SITE_PATH[@]}" | sort)
+  render_default >"$tmp/sites/00-default.conf"
+
+  write_fastcgi_params
+  local changed=0
+  if ! diff -rq "$tmp/sites" "$CONF/nginx/sites" >/dev/null 2>&1 || [[ ! -f $CONF/nginx/nginx.conf ]]; then
+    render_nginx_conf "$tmp" >"$tmp/nginx.conf"
+    "$ng" -t -p "$STATE/nginx" -c "$tmp/nginx.conf" -e stderr >"$tmp/test.log" 2>&1 \
+      || { cat "$tmp/test.log" >&2; die "nginx config test failed; keeping the previous config"; }
+    rm -rf "$CONF/nginx/sites"; cp -r "$tmp/sites" "$CONF/nginx/sites"
+    render_nginx_conf "$CONF/nginx" >"$CONF/nginx/nginx.conf"
+    changed=1
+  fi
+
+  local up=0; sc is-active --quiet vela.target 2>/dev/null && up=1
+  for v in "${!used[@]}"; do
+    write_fpm_conf "$v"
+    sc is-enabled --quiet "vela-fpm@$v" 2>/dev/null || sc enable "vela-fpm@$v" >/dev/null 2>&1 || true
+    (( up )) && ! sc is-active --quiet "vela-fpm@$v" && sc start "vela-fpm@$v" || true
+  done
+  (( changed && up )) && sc reload vela-nginx 2>/dev/null || true
+
+  local pu; pu=$(render_path_unit)
+  if [[ $pu != "$(cat "$UNITS/vela-sites.path" 2>/dev/null || true)" ]]; then
+    printf '%s\n' "$pu" >"$UNITS/vela-sites.path"
+    sc daemon-reload
+    sc is-enabled --quiet vela-sites.path 2>/dev/null && sc restart vela-sites.path || true
+  fi
+  (( quiet )) || say "regen: ${#SITE_PATH[@]} site(s), nginx $( ((changed)) && echo reloaded || echo unchanged )"
+}
+
+cmd_park() {
+  local d; d=$(readlink -f "${1:-$PWD}"); [[ -d $d ]] || die "not a directory: $d"
+  mkdir -p "$CONF"; touch "$CONF/parked"
+  grep -qxF "$d" "$CONF/parked" || echo "$d" >>"$CONF/parked"
+  cmd_regen
+}
+cmd_forget() {
+  local d; d=$(readlink -f "${1:-$PWD}")
+  [[ -f $CONF/parked ]] && { grep -vxF "$d" "$CONF/parked" >"$CONF/parked.new" || true; mv "$CONF/parked.new" "$CONF/parked"; }
+  cmd_regen
+}
+cmd_link() {
+  local name="" secure=0 a
+  for a in "$@"; do case $a in --secure) secure=1 ;; *) name=$a ;; esac; done
+  name=$(site_arg "$name")
+  mkdir -p "$CONF/links" "$CONF/secure"
+  ln -sfn "$(readlink -f "$PWD")" "$CONF/links/$name"
+  if (( secure )); then touch "$CONF/secure/$name"; fi
+  cmd_regen
+  say "http$( ((secure)) && echo s )://$name.$TLD"
+}
+cmd_unlink() {
+  local n; n=$(site_arg "${1:-}")
+  [[ -L $CONF/links/$n ]] || die "not a linked site: $n"
+  rm -f "$CONF/links/$n" "$CONF/secure/$n"
+  cmd_regen
+}
+cmd_secure() {
+  local n; n=$(site_arg "${1:-}"); require_site "$n"
+  mkdir -p "$CONF/secure"; ensure_cert "$n"; touch "$CONF/secure/$n"
+  cmd_regen; say "https://$n.$TLD"
+}
+cmd_unsecure() { local n; n=$(site_arg "${1:-}"); rm -f "$CONF/secure/$n"; cmd_regen; }
+cmd_isolate() {
+  local ver="" name="" a
+  for a in "$@"; do case $a in --site=*) name=${a#--site=} ;; *) ver=$a ;; esac; done
+  [[ $ver =~ ^[0-9]+\.[0-9]+$ ]] || die "usage: vela isolate <major.minor> [--site=name]"
+  local n; n=$(site_arg "$name"); require_site "$n"
+  [[ -n $(php_prefix "$ver") ]] || php_install "$ver"
+  (cd "${SITE_PATH[$n]}" && mise use --env local "php@$ver")
+  cmd_regen
+}
+cmd_unisolate() {
+  local name="" a; for a in "$@"; do case $a in --site=*) name=${a#--site=} ;; esac; done
+  local n; n=$(site_arg "$name"); require_site "$n"
+  (cd "${SITE_PATH[$n]}" && mise unuse --env local php)
+  cmd_regen
+}
+cmd_sites() {
+  load_sites
+  printf '%-28s %-6s %-7s %s\n' SITE PHP SECURE PATH
+  local n
+  while IFS= read -r n; do
+    [[ -n $n ]] || continue
+    printf '%-28s %-6s %-7s %s\n' "$n.$TLD" "$(site_php "${SITE_PATH[$n]}")" \
+      "$([[ -e $CONF/secure/$n ]] && echo yes || echo no)" "${SITE_PATH[$n]}"
+  done < <(printf '%s\n' "${!SITE_PATH[@]}" | sort)
+}
+cmd_links() { local l; for l in "$CONF"/links/*; do printf '%s -> %s\n' "${l##*/}" "$(readlink "$l")"; done; }
+cmd_open() { local n; n=$(site_arg "${1:-}"); local s=http; [[ -e $CONF/secure/$n ]] && s=https; xdg-open "$s://$n.$TLD"; }
+
+# ---- xdebug ----------------------------------------------------------------
+cmd_xdebug_install() {
+  local v=${1:-$(global_php)} p; p=$(php_prefix "$v"); [[ -n $p ]] || die "PHP $v not installed"
+  "$p/bin/pecl" install xdebug
+  cat >"$p/conf.d/xdebug.ini" <<'EOF'
+zend_extension=xdebug
+xdebug.mode=debug,develop
+xdebug.start_with_request=trigger
+xdebug.client_port=9003
+EOF
+  sc try-restart "vela-fpm@$v" || true
+  say "Xdebug enabled for PHP $v (trigger mode, port 9003)"
+}
+cmd_xdebug_remove() {
+  local v=${1:-$(global_php)} p; p=$(php_prefix "$v"); [[ -n $p ]] || die "PHP $v not installed"
+  rm -f "$p/conf.d/xdebug.ini"; sc try-restart "vela-fpm@$v" || true
+}
+
+# ---- addons ----------------------------------------------------------------
+SVCS="mysql mariadb postgres redis meilisearch minio rustfs mongodb"
+svc_meta() { # svc -> SV_VERS (first = default) SV_PORT SV_SRC
+  case $1 in
+    mysql)       SV_VERS="8.4 8.0 9.7";                    SV_PORT=3306;  SV_SRC=mise:vfox:jdx/vfox-mysql ;;
+    mariadb)     SV_VERS="11.8 10.11 12.3 13.0";           SV_PORT=3306;  SV_SRC=fetch ;;
+    postgres)    SV_VERS="17 18 16 15 14";                 SV_PORT=5432;  SV_SRC=mise:vfox:mise-plugins/vfox-postgres ;;
+    redis)       SV_VERS="7.4 8.4";                        SV_PORT=6379;  SV_SRC=mise:vfox:mise-plugins/vfox-redis ;;
+    meilisearch) SV_VERS="1";                              SV_PORT=7700;  SV_SRC=mise:github:meilisearch/meilisearch ;;
+    minio)       SV_VERS="2025-09-07 2025-07-23 2024-03-05"; SV_PORT=9000; SV_SRC=go ;;
+    rustfs)      SV_VERS="1";                              SV_PORT=9100;  SV_SRC=mise:github:rustfs/rustfs ;;
+    mongodb)     SV_VERS="7.0 8.0";                        SV_PORT=27017; SV_SRC=fetch ;;
+    *) return 1 ;;
+  esac
+}
+minio_tag() {
+  case $1 in
+    2025-09-07) echo RELEASE.2025-09-07T16-13-09Z ;;
+    2025-07-23) echo RELEASE.2025-07-23T15-54-02Z ;;
+    2024-03-05) echo RELEASE.2024-03-05T04-48-44Z ;;
+    *) return 1 ;;
+  esac
+}
+fetch_url() { # svc ver
+  local v
+  case $1:$2 in
+    mariadb:10.11) v=10.11.19 ;; mariadb:11.8) v=11.8.9 ;; mariadb:12.3) v=12.3.3 ;; mariadb:13.0) v=13.0.2 ;;
+    mongodb:7.0) v=7.0.45 ;;     mongodb:8.0) v=8.0.34 ;;
+    *) return 1 ;;
+  esac
+  case $1 in
+    mariadb) echo "https://archive.mariadb.org/mariadb-$v/bintar-linux-systemd-x86_64/mariadb-$v-linux-systemd-x86_64.tar.gz" ;;
+    mongodb) echo "https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-ubuntu2204-$v.tgz" ;;
+  esac
+}
+svc_prefix() { # svc ver
+  case $SV_SRC in
+    mise:*) mise where "${SV_SRC#mise:}@$2" 2>/dev/null || true ;;
+    *)      echo "$DATA/tools/$1/$2" ;;
+  esac
+}
+svc_install_native() { # svc ver
+  local svc=$1 ver=$2 dest url tag
+  case $SV_SRC in
+    mise:*) mise install "${SV_SRC#mise:}@$ver" ;;
+    fetch)
+      [[ $(uname -m) == x86_64 ]] || die "$svc download is only wired for x86_64"
+      url=$(fetch_url "$svc" "$ver") || die "unknown $svc version $ver (known: $SV_VERS)"
+      dest=$DATA/tools/$svc/$ver
+      if [[ ! -f $dest/.vela-ok ]]; then
+        rm -rf "$dest"; mkdir -p "$dest"
+        say "downloading $url"
+        curl -fL --progress-bar "$url" | tar -xz --strip-components=1 -C "$dest"
+        touch "$dest/.vela-ok"
+      fi ;;
+    go)
+      tag=$(minio_tag "$ver") || die "unknown minio version $ver (known: $SV_VERS)"
+      dest=$DATA/tools/minio/$ver
+      if [[ ! -x $dest/bin/minio ]]; then
+        say "compiling MinIO $tag from source (dl.min.io no longer serves binaries)"
+        mkdir -p "$dest/bin"
+        GOBIN=$dest/bin mise x go@latest -- go install "github.com/minio/minio@$tag"
+      fi ;;
+  esac
+  [[ -d $(svc_prefix "$svc" "$ver") ]] || die "install of $svc $ver failed"
+}
+
+# ---- credentials: kinds are userpass (db, object store), pass (redis), key (meilisearch), none
+svc_cred_kind() {
+  case $1 in
+    mysql|mariadb|postgres|minio|rustfs) echo userpass ;;
+    redis) echo pass ;;
+    meilisearch) echo key ;;
+  esac
+}
+svc_cred_defaults() { # svc -> DEF_USER DEF_PASS
+  case $1 in
+    minio|rustfs) DEF_USER=root DEF_PASS=password ;;
+    mysql|mariadb|postgres) DEF_USER=root DEF_PASS="" ;;
+    *) DEF_USER="" DEF_PASS="" ;;
+  esac
+}
+load_creds() { svc_cred_defaults "$1"; DB_USER=${DB_USER-$DEF_USER}; DB_PASS=${DB_PASS-$DEF_PASS}; }
+svc_creds() { # svc user pass -> one-line description (custom passwords are masked)
+  local shown
+  svc_cred_defaults "$1"
+  if [[ -z $3 ]]; then shown=none; elif [[ $3 == "$DEF_PASS" ]]; then shown=$3; else shown='***'; fi
+  case $(svc_cred_kind "$1") in
+    userpass) echo "user $2, password $shown" ;;
+    pass)     echo "password $shown" ;;
+    key)      echo "master key $shown" ;;
+    *)        echo "no auth" ;;
+  esac
+}
+tty_secret() { # prompt -> REPLY (no echo)
+  (( YES )) && return 1
+  { printf '%s' "$1" >/dev/tty; read -rs REPLY </dev/tty; printf '\n' >/dev/tty; } 2>/dev/null
+}
+ask_creds() { # svc  (FLAG_USER / FLAG_PASS from the command line) -> DB_USER DB_PASS
+  local svc=$1 kind pw
+  kind=$(svc_cred_kind "$svc"); svc_cred_defaults "$svc"
+  DB_USER=$DEF_USER; DB_PASS=$DEF_PASS
+  [[ -n $kind ]] || return 0
+  if [[ -n ${FLAG_USER:-} || -n ${FLAG_PASS:-} ]]; then
+    DB_USER=${FLAG_USER:-$DEF_USER}; DB_PASS=${FLAG_PASS:-$DEF_PASS}
+  elif ! ask "Use the default credentials for $svc ($(svc_creds "$svc" "$DEF_USER" "$DEF_PASS"))?" y; then
+    if [[ $kind == userpass ]]; then
+      tty_read "  username [$DEF_USER]: " && [[ -n $REPLY ]] && DB_USER=$REPLY
+    fi
+    tty_secret "  $( [[ $kind == key ]] && echo 'master key' || echo password ) (empty = none): " || true
+    pw=$REPLY
+    if [[ -n $pw ]]; then
+      tty_secret "  repeat: " || true
+      [[ $REPLY == "$pw" ]] || die "passwords do not match"
+    fi
+    DB_PASS=$pw
+  fi
+  if [[ $svc == minio || $svc == rustfs ]]; then
+    (( ${#DB_USER} >= 3 && ${#DB_PASS} >= 8 )) || die "$svc needs a username of 3+ and a password of 8+ characters"
+  fi
+  [[ $svc == mongodb || ! $DB_USER =~ [[:space:]] ]] || die "username must not contain spaces"
+}
+sqlq() { local v=${1//\\/\\\\}; printf '%s' "${v//\'/\'\'}"; }
+conf_q() { local v=${1//\\/\\\\}; printf '"%s"' "${v//\"/\\\"}"; }
+ct_env() { export "$1=$2"; CT_ENV+=(-e "$1"); }   # name only on argv, value via environment
+
+# container spec: sets CT_IMG CT_DATA CT_PORT and arrays CT_ENV CT_ARGS CT_PORTS CT_MOUNTS (needs DB_USER DB_PASS)
+svc_container_spec() { # svc ver port
+  local svc=$1 ver=$2 port=$3
+  CT_ENV=(); CT_ARGS=(); CT_MOUNTS=(); CT_PORTS=(-p "127.0.0.1:$port:__IN__")
+  case $svc in
+    mysql)
+      CT_IMG=docker.io/library/mysql:$ver; CT_DATA=/var/lib/mysql; CT_PORT=3306
+      if [[ $DB_USER == root ]]; then
+        if [[ -z $DB_PASS ]]; then CT_ENV+=(-e MYSQL_ALLOW_EMPTY_PASSWORD=yes); else ct_env MYSQL_ROOT_PASSWORD "$DB_PASS"; fi
+      else
+        [[ -n $DB_PASS ]] || die "a custom non-root user needs a password in containers"
+        ct_env MYSQL_ROOT_PASSWORD "$DB_PASS"; ct_env MYSQL_USER "$DB_USER"; ct_env MYSQL_PASSWORD "$DB_PASS"
+      fi ;;
+    mariadb)
+      CT_IMG=docker.io/library/mariadb:$ver; CT_DATA=/var/lib/mysql; CT_PORT=3306
+      if [[ $DB_USER == root ]]; then
+        if [[ -z $DB_PASS ]]; then CT_ENV+=(-e MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=1); else ct_env MARIADB_ROOT_PASSWORD "$DB_PASS"; fi
+      else
+        [[ -n $DB_PASS ]] || die "a custom non-root user needs a password in containers"
+        ct_env MARIADB_ROOT_PASSWORD "$DB_PASS"; ct_env MARIADB_USER "$DB_USER"; ct_env MARIADB_PASSWORD "$DB_PASS"
+      fi ;;
+    postgres)
+      CT_IMG=docker.io/library/postgres:$ver; CT_DATA=/var/lib/postgresql/data; CT_PORT=5432
+      if (( ${ver%%.*} >= 18 )); then CT_DATA=/var/lib/postgresql; fi
+      ct_env POSTGRES_USER "$DB_USER"
+      if [[ -n $DB_PASS ]]; then ct_env POSTGRES_PASSWORD "$DB_PASS"; else CT_ENV+=(-e POSTGRES_HOST_AUTH_METHOD=trust); fi ;;
+    redis)       CT_IMG=docker.io/library/redis:$ver; CT_DATA=/data; CT_PORT=6379 ;;
+    meilisearch)
+      CT_IMG=docker.io/getmeili/meilisearch:v$ver; CT_DATA=/meili_data; CT_PORT=7700
+      CT_ENV=(-e MEILI_ENV=development -e MEILI_NO_ANALYTICS=true)
+      if [[ -n $DB_PASS ]]; then ct_env MEILI_MASTER_KEY "$DB_PASS"; fi ;;
+    minio)       die "MinIO no longer publishes pullable images; use --via native (compiles from source)" ;;
+    rustfs)
+      CT_IMG=docker.io/rustfs/rustfs:latest; CT_DATA=/data; CT_PORT=9000
+      CT_PORTS+=(-p "127.0.0.1:$((port+1)):9001")
+      ct_env RUSTFS_ACCESS_KEY "$DB_USER"; ct_env RUSTFS_SECRET_KEY "$DB_PASS" ;;
+    mongodb)     CT_IMG=docker.io/library/mongo:$ver; CT_DATA=/data/db; CT_PORT=27017 ;;
+  esac
+  CT_PORTS[1]=${CT_PORTS[1]/__IN__/$CT_PORT}
+}
+svc_exec_container() {
+  local rt=$METHOD d=$DATA/data/$ID z=""
+  have "$rt" || die "$rt not found"
+  mkdir -p "$d" "$RUN"
+  svc_container_spec "$SVC" "$VER" "$PORT"
+  [[ $rt == podman ]] && z=":Z"
+  if [[ $SVC == redis && -n $DB_PASS ]]; then   # password via a 600 config file, never argv
+    ( umask 077; printf 'requirepass %s\n' "$(conf_q "$DB_PASS")" >"$RUN/$ID.conf" )
+    CT_MOUNTS=(-v "$RUN/$ID.conf:/etc/vela-redis.conf:ro$z"); CT_ARGS=(redis-server /etc/vela-redis.conf)
+  fi
+  "$rt" rm -f "vela-$ID" >/dev/null 2>&1 || true
+  exec "$rt" run --rm --name "vela-$ID" "${CT_PORTS[@]}" -v "$d:$CT_DATA$z" "${CT_MOUNTS[@]}" "${CT_ENV[@]}" "$CT_IMG" "${CT_ARGS[@]}"
+}
+svc_exec_native() {
+  local p d=$DATA/data/$ID b init
+  p=$(svc_prefix "$SVC" "$VER"); [[ -d $p ]] || die "$SVC $VER is not installed"
+  mkdir -p "$d" "$RUN"
+  case $SVC in
+    mysql|mariadb)
+      # idempotent init file (runs at every start, so editing the creds and restarting works)
+      init=$RUN/$ID-init.sql
+      ( umask 077
+        { printf "ALTER USER 'root'@'localhost' IDENTIFIED BY '%s';\n" "$( [[ $DB_USER == root ]] && sqlq "$DB_PASS" )"
+          if [[ $DB_USER != root ]]; then
+            printf "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s';\n" "$(sqlq "$DB_USER")" "$(sqlq "$DB_PASS")"
+            printf "ALTER USER '%s'@'%%' IDENTIFIED BY '%s';\n" "$(sqlq "$DB_USER")" "$(sqlq "$DB_PASS")"
+            printf "GRANT ALL PRIVILEGES ON *.* TO '%s'@'%%' WITH GRANT OPTION;\n" "$(sqlq "$DB_USER")"
+          fi; } >"$init" )
+      if [[ $SVC == mysql ]]; then
+        b=$(bin_of "$p" mysqld)
+        [[ -d $d/mysql ]] || "$b" --no-defaults --initialize-insecure --basedir="$p" --datadir="$d"
+        exec "$b" --no-defaults --basedir="$p" --datadir="$d" --port="$PORT" --bind-address=127.0.0.1 \
+          --mysqlx=OFF --socket="$RUN/$ID.sock" --pid-file="$RUN/$ID.pid" --init-file="$init"
+      else
+        [[ -d $d/mysql ]] || "$(bin_of "$p" mariadb-install-db)" --no-defaults --basedir="$p" --datadir="$d" \
+          --auth-root-authentication-method=normal
+        exec "$(bin_of "$p" mariadbd)" --no-defaults --basedir="$p" --datadir="$d" --port="$PORT" \
+          --bind-address=127.0.0.1 --socket="$RUN/$ID.sock" --pid-file="$RUN/$ID.pid" --init-file="$init"
+      fi ;;
+    postgres)
+      if [[ ! -f $d/PG_VERSION ]]; then   # creds are fixed when the data dir is first created
+        local -a auth=(--auth=trust)
+        if [[ -n $DB_PASS ]]; then
+          ( umask 077; printf '%s' "$DB_PASS" >"$RUN/$ID.pw" )
+          auth=(--auth=scram-sha-256 --pwfile="$RUN/$ID.pw")
+        fi
+        "$(bin_of "$p" initdb)" -D "$d" -U "$DB_USER" -E UTF8 "${auth[@]}"
+        rm -f "$RUN/$ID.pw"
+      fi
+      exec "$(bin_of "$p" postgres)" -D "$d" -p "$PORT" -c listen_addresses=127.0.0.1 -c unix_socket_directories="$RUN" ;;
+    redis)
+      init=$RUN/$ID.conf
+      ( umask 077
+        { printf 'bind 127.0.0.1\nport %s\ndir %s\n' "$PORT" "$d"
+          if [[ -n $DB_PASS ]]; then printf 'requirepass %s\n' "$(conf_q "$DB_PASS")"; fi; } >"$init" )
+      exec "$(bin_of "$p" redis-server)" "$init" ;;
+    meilisearch)
+      export MEILI_HTTP_ADDR=127.0.0.1:$PORT MEILI_DB_PATH=$d/data.ms MEILI_DUMP_DIR=$d/dumps \
+             MEILI_ENV=development MEILI_NO_ANALYTICS=true
+      if [[ -n $DB_PASS ]]; then export MEILI_MASTER_KEY=$DB_PASS; fi
+      exec "$(bin_of "$p" meilisearch)" ;;
+    minio)
+      export MINIO_ROOT_USER=$DB_USER MINIO_ROOT_PASSWORD=$DB_PASS
+      exec "$(bin_of "$p" minio)" server "$d" --address "127.0.0.1:$PORT" --console-address "127.0.0.1:$((PORT+1))" ;;
+    rustfs)
+      export RUSTFS_ACCESS_KEY=$DB_USER RUSTFS_SECRET_KEY=$DB_PASS RUSTFS_ADDRESS=127.0.0.1:$PORT \
+             RUSTFS_CONSOLE_ENABLE=true RUSTFS_CONSOLE_ADDRESS=127.0.0.1:$((PORT+1))
+      exec "$(bin_of "$p" rustfs)" "$d" ;;
+    mongodb)
+      exec "$(bin_of "$p" mongod)" --dbpath "$d" --bind_ip 127.0.0.1 --port "$PORT" ;;
+  esac
+}
+cmd_svc_run() { # id (called by systemd)
+  ID=$1; [[ -f $CONF/services/$ID.env ]] || die "no such service: $ID"
+  # shellcheck disable=SC1090
+  . "$CONF/services/$ID.env"
+  svc_meta "$SVC"; load_creds "$SVC"
+  if [[ $METHOD == native ]]; then svc_exec_native; else svc_exec_container; fi
+}
+svc_port_free() { # port, ignoring our own id
+  local f port
+  for f in "$CONF"/services/*.env; do
+    [[ ${f##*/} == "${2:-}.env" ]] && continue
+    port=$(sed -n 's/^PORT=//p' "$f"); [[ $port == "$1" ]] && return 1
+  done
+  if have ss && ss -ltn "sport = :$1" 2>/dev/null | grep -q LISTEN; then return 1; fi
+  return 0
+}
+runtime_avail() { have podman && echo podman || { have docker && echo docker || true; }; }
+
+cmd_svc_available() {
+  local s
+  printf '%-12s %-34s %-6s %s\n' SERVICE VERSIONS PORT SOURCE
+  for s in $SVCS; do
+    svc_meta "$s"
+    printf '%-12s %-34s %-6s %s\n' "$s" "$SV_VERS" "$SV_PORT" "$SV_SRC"
+  done
+  echo; echo "install: vela service:add <svc> [ver] [--via native|podman|docker] [--port N]"
+}
+svc_clients() { # client tools worth putting on PATH
+  case $1 in
+    postgres) echo "psql pg_dump pg_dumpall pg_restore createdb dropdb" ;;
+    redis)    echo "redis-cli redis-benchmark" ;;
+    mysql)    echo "mysql mysqldump mysqladmin" ;;
+    mariadb)  echo "mariadb mariadb-dump mariadb-admin" ;;
+  esac
+}
+svc_expose() { # id: symlink native client tools into ~/.local/bin (last added version wins)
+  # shellcheck disable=SC1090
+  ( . "$CONF/services/$1.env"; [[ $METHOD == native ]] || exit 0
+    svc_meta "$SVC"; p=$(svc_prefix "$SVC" "$VER")
+    mkdir -p "$HOME/.local/bin" "$CONF/defaults"; echo "$1" >"$CONF/defaults/$SVC"
+    for c in $(svc_clients "$SVC"); do b=$(bin_of "$p" "$c") && ln -sfn "$b" "$HOME/.local/bin/$c"; done )
+}
+svc_unexpose() { # id: drop links that point into this addon's prefix
+  # shellcheck disable=SC1090
+  ( . "$CONF/services/$1.env"; svc_meta "$SVC"; p=$(svc_prefix "$SVC" "$VER")
+    # only the default owns the links; a sibling sharing the same install must not remove them
+    [[ -n $p && $(cat "$CONF/defaults/$SVC" 2>/dev/null) == "$1" ]] || exit 0
+    rm -f "$CONF/defaults/$SVC"
+    for l in "$HOME/.local/bin"/*; do
+      if [[ -L $l && $(readlink "$l") == "$p"/* ]]; then rm -f "$l"; fi
+    done )
+}
+cmd_svc_add() {
+  local svc="" ver="" via=native port="" a
+  FLAG_USER=""; FLAG_PASS=""
+  while (( $# )); do
+    case $1 in
+      --via)    via=$2; shift ;;
+      --via=*)  via=${1#--via=} ;;
+      --port)   port=$2; shift ;;
+      --port=*) port=${1#--port=} ;;
+      --user)   FLAG_USER=$2; shift ;;
+      --user=*) FLAG_USER=${1#--user=} ;;
+      --password)   FLAG_PASS=$2; shift ;;
+      --password=*) FLAG_PASS=${1#--password=} ;;
+      *) if [[ -z $svc ]]; then svc=$1; elif [[ -z $ver ]]; then ver=$1; else die "unexpected: $1"; fi ;;
+    esac
+    shift
+  done
+  [[ -n $svc ]] || die "usage: vela service:add <svc> [ver] [--via native|podman|docker] [--port N]"
+  svc_meta "$svc" || die "unknown service '$svc' (see: vela service:available)"
+  ver=${ver:-${SV_VERS%% *}}
+  port=${port:-$SV_PORT}
+  case $via in native) ;; podman|docker) have "$via" || die "$via is not installed" ;; *) die "--via must be native, podman or docker" ;; esac
+  local id=$svc-$ver
+  svc_port_free "$port" "$id" || die "port $port is in use; pick another with --port"
+  mkdir -p "$CONF/services" "$DATA/data"
+  ask_creds "$svc"
+  if [[ $via == native ]]; then
+    svc_install_native "$svc" "$ver"
+  else
+    svc_container_spec "$svc" "$ver" "$port"
+    say "pulling $CT_IMG"
+    "$via" pull "$CT_IMG"
+  fi
+  ( umask 077
+    { printf 'SVC=%s\nVER=%s\nPORT=%s\nMETHOD=%s\n' "$svc" "$ver" "$port" "$via"
+      printf 'DB_USER=%q\nDB_PASS=%q\n' "$DB_USER" "$DB_PASS"; } >"$CONF/services/$id.env" )
+  if [[ $via == native && -n $(svc_clients "$svc") ]]; then
+    local cur def=y; cur=$(cat "$CONF/defaults/$svc" 2>/dev/null || true)
+    if [[ -n $cur && $cur != "$id" ]]; then def=n; fi
+    if ask "Set $id as the default $svc? (its $(svc_clients "$svc" | cut -d' ' -f1,2) etc. go on your PATH; current default: ${cur:-none})" "$def"; then
+      svc_expose "$id"
+    fi
+  fi
+  sc enable --now "vela-svc@$id"
+  say "$id running on 127.0.0.1:$port ($via). $(svc_creds "$svc" "$DB_USER" "$DB_PASS")"
+}
+cmd_svc_list() {
+  local f id st
+  printf '%-18s %-7s %-6s %-9s\n' ID PORT VIA STATE
+  for f in "$CONF"/services/*.env; do
+    id=$(basename "$f" .env)
+    st=$(sc is-active "vela-svc@$id" 2>/dev/null || true)
+    # shellcheck disable=SC1090
+    ( . "$f"; load_creds "$SVC"; d=""; if [[ $(cat "$CONF/defaults/$SVC" 2>/dev/null) == "$id" ]]; then d=" (default)"; fi
+      printf '%-18s %-7s %-6s %-9s %s%s\n' "$id" "$PORT" "$METHOD" "$st" "$(svc_creds "$SVC" "$DB_USER" "$DB_PASS")" "$d" )
+  done
+}
+cmd_svc_remove() {
+  local id=${1:-} purge=0; [[ ${2:-} == --purge ]] && purge=1
+  [[ -f $CONF/services/$id.env ]] || die "no such service: $id"
+  sc disable --now "vela-svc@$id" 2>/dev/null || true
+  svc_unexpose "$id"
+  for rt in podman docker; do have "$rt" && "$rt" rm -f "vela-$id" >/dev/null 2>&1 || true; done
+  rm -f "$CONF/services/$id.env"
+  (( purge )) && rm -rf "${DATA:?}/data/$id"
+  say "removed $id$( ((purge)) || echo ' (data kept; use --purge to delete)' )"
+}
+
+# ---- install / uninstall -----------------------------------------------------
+SELF_UNIT_BIN='%h/.local/bin/vela'
+write_units() {
+  mkdir -p "$UNITS"
+  cat >"$UNITS/vela.target" <<'EOF'
+[Unit]
+Description=vela dev environment
+[Install]
+WantedBy=default.target
+EOF
+  cat >"$UNITS/vela-nginx.service" <<EOF
+[Unit]
+Description=vela nginx
+PartOf=vela.target
+[Service]
+ExecStart=$SELF_UNIT_BIN nginx-run
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+[Install]
+WantedBy=vela.target
+EOF
+  cat >"$UNITS/vela-fpm@.service" <<EOF
+[Unit]
+Description=vela php-fpm %i
+PartOf=vela.target
+[Service]
+ExecStart=$SELF_UNIT_BIN fpm-run %i
+ExecReload=/bin/kill -USR2 \$MAINPID
+Restart=on-failure
+[Install]
+WantedBy=vela.target
+EOF
+  cat >"$UNITS/vela-svc@.service" <<EOF
+[Unit]
+Description=vela addon %i
+PartOf=vela.target
+[Service]
+ExecStart=$SELF_UNIT_BIN service run %i
+TimeoutStopSec=30
+Restart=on-failure
+[Install]
+WantedBy=vela.target
+EOF
+  cat >"$UNITS/vela-sites.service" <<EOF
+[Unit]
+Description=vela regenerate sites
+StartLimitIntervalSec=0
+[Service]
+Type=oneshot
+ExecStart=$SELF_UNIT_BIN regen --quiet
+EOF
+  cat >"$UNITS/vela-dns.service" <<EOF
+[Unit]
+Description=vela dnsmasq (.$TLD)
+PartOf=vela.target
+[Service]
+ExecStart=$SELF_UNIT_BIN dns-run
+Restart=on-failure
+[Install]
+WantedBy=vela.target
+EOF
+}
+sys_write() { # path [mode]; content on stdin
+  local f=$1 mode=${2:-644}
+  sudo mkdir -p "$(dirname "$f")"
+  sudo tee "$f" >/dev/null && sudo chmod "$mode" "$f"
+  mkdir -p "$CONF"; touch "$CONF/system-files"
+  grep -qxF "$f" "$CONF/system-files" || echo "$f" >>"$CONF/system-files"
+}
+dns_mode() {
+  if systemctl is-active --quiet systemd-resolved && have resolvectl; then echo resolved
+  elif systemctl is-active --quiet NetworkManager; then echo nm
+  else echo none; fi
+}
+dns_run() {
+  local dm; dm=$(find_bin dnsmasq) || die "dnsmasq not found"
+  exec "$dm" -k -C /dev/null --port="$DNS_PORT" --listen-address=127.0.0.1 --bind-interfaces \
+    --no-resolv --no-hosts --pid-file= --address="/$TLD/127.0.0.1"
+}
+warn_dns_leftovers() {
+  have resolvectl || return 0
+  resolvectl status 2>/dev/null | awk -v t="~$TLD" '/^Link /{l=$0} index($0,t){print l}' | grep -v vela0 | sort -u | while read -r l; do
+    warn "another resolver link already routes .$TLD: $l"
+  done || true
+}
+system_setup() {
+  say "system setup (sudo)"
+  printf 'net.ipv4.ip_unprivileged_port_start=80\n' | sys_write /etc/sysctl.d/99-vela-ports.conf
+  sudo sysctl -q -w net.ipv4.ip_unprivileged_port_start=80
+  [[ $(loginctl show-user "$USER" -p Linger --value 2>/dev/null) == yes ]] || sudo loginctl enable-linger "$USER"
+  local mode; mode=$(dns_mode)
+  case $mode in
+    resolved)
+      sys_write /etc/systemd/system/vela-dns-link.service <<'EOF'
+[Unit]
+Description=vela .test DNS link
+After=systemd-resolved.service
+Wants=systemd-resolved.service
+PartOf=systemd-resolved.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip link show vela0 >/dev/null 2>&1 || ip link add vela0 type dummy; ip addr replace 192.0.2.1/32 dev vela0; ip link set vela0 up; resolvectl dns vela0 127.0.0.1:5300; resolvectl domain vela0 ~test; resolvectl default-route vela0 false'
+ExecStop=/bin/sh -c 'ip link del vela0 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      if have nmcli; then
+        printf 'SUBSYSTEM=="net", KERNEL=="vela0", ENV{NM_UNMANAGED}="1"\n' | sys_write /etc/udev/rules.d/90-vela-nm-unmanaged.rules
+        sudo udevadm control --reload
+      fi
+      sudo systemctl daemon-reload
+      sudo systemctl enable --now vela-dns-link.service
+      warn_dns_leftovers ;;
+    nm)
+      ask "systemd-resolved is off. Switch NetworkManager to dns=dnsmasq so .$TLD resolves?" y \
+        || die "cannot resolve .$TLD without a DNS hook; aborting"
+      printf '[main]\ndns=dnsmasq\n' | sys_write /etc/NetworkManager/conf.d/vela.conf
+      printf 'address=/%s/127.0.0.1\n' "$TLD" | sys_write /etc/NetworkManager/dnsmasq.d/vela.conf
+      sudo systemctl restart NetworkManager ;;
+    none)
+      die "neither systemd-resolved nor NetworkManager is active. Point .$TLD at 127.0.0.1 yourself (e.g. dnsmasq address=/$TLD/127.0.0.1)." ;;
+  esac
+  echo "$mode" >"$CONF/dns-mode"
+}
+node_present() {
+  have node || [[ -n ${NVM_DIR:-} || -d $HOME/.nvm ]] || [[ -n $(mise ls -g node 2>/dev/null) ]]
+}
+# ---- distro packages + mise (first step of `vela install`) -----------------
+DEPS_ONLY=0
+detect_family() {
+  [[ -r /etc/os-release ]] || die "/etc/os-release missing."
+  OSID=$(. /etc/os-release; echo "${ID:-}")
+  local like name id
+  like=$(. /etc/os-release; echo "${ID_LIKE:-}"); name=$(. /etc/os-release; echo "${PRETTY_NAME:-$OSID}")
+  FAMILY=""
+  for id in $OSID $like; do
+    case $id in
+      arch|cachyos|manjaro|endeavouros)     FAMILY=arch ;;
+      debian|ubuntu|linuxmint|pop)          FAMILY=debian ;;
+      fedora|rhel|centos|rocky|almalinux)   FAMILY=fedora ;;
+      opensuse*|suse|sles)                  FAMILY=suse ;;
+    esac
+    [[ -n $FAMILY ]] && break
+  done
+  [[ -n $FAMILY ]] || die "unsupported distro '$OSID'. Supported: arch, debian/ubuntu, fedora/rhel, opensuse."
+  say "distro family: $FAMILY ($name)"
+}
+pkg_install() {
+  case $FAMILY in
+    arch)   $SUDO pacman -S --needed --noconfirm "$@" ;;
+    debian) $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" ;;
+    fedora) $SUDO dnf install -y --allowerasing "$@" ;;
+    suse)   $SUDO zypper --non-interactive install --no-recommends "$@" ;;
+  esac
+}
+install_deps() {
+  detect_family
+  # core: vela itself + building PHP and Postgres. opt: best-effort (MySQL runtime libs).
+  local -a CORE OPT
+  case $FAMILY in
+    arch)
+      CORE=(nginx dnsmasq nss git curl base-devel libtool autoconf bison flex re2c pkgconf unzip
+            libxml2 openssl oniguruma libzip icu gd libjpeg-turbo libpng freetype2 libwebp libsodium
+            sqlite postgresql-libs libxslt gmp readline bzip2 perl)
+      OPT=(libaio ncurses) ;;
+    debian)
+      CORE=(nginx dnsmasq-base libnss3-tools git curl ca-certificates build-essential libtool autoconf bison
+            flex re2c pkg-config unzip xz-utils libxml2-dev libssl-dev libcurl4-openssl-dev libonig-dev
+            libzip-dev libicu-dev libgd-dev libjpeg-dev libpng-dev libfreetype-dev libwebp-dev libsodium-dev
+            libsqlite3-dev libpq-dev libxslt1-dev libgmp-dev libreadline-dev libbz2-dev zlib1g-dev perl)
+      OPT=(libaio1t64 libaio1 libncurses6) ;;
+    fedora)
+      CORE=(nginx dnsmasq nss-tools git curl gcc gcc-c++ make libtool autoconf automake bison flex re2c
+            pkgconf-pkg-config unzip libxml2-devel openssl-devel libcurl-devel oniguruma-devel libzip-devel
+            libicu-devel gd-devel libjpeg-turbo-devel libpng-devel freetype-devel libwebp-devel
+            libsodium-devel sqlite-devel libpq-devel libxslt-devel gmp-devel readline-devel bzip2-devel
+            zlib-devel perl)
+      OPT=(libaio ncurses-libs) ;;
+    suse)
+      CORE=(nginx dnsmasq mozilla-nss-tools git curl gcc gcc-c++ make libtool autoconf automake bison flex re2c
+            pkg-config unzip libxml2-devel libopenssl-devel libcurl-devel oniguruma-devel libzip-devel
+            libicu-devel gd-devel libjpeg8-devel libpng16-devel freetype2-devel libwebp-devel
+            libsodium-devel sqlite3-devel postgresql-devel libxslt-devel gmp-devel readline-devel
+            libbz2-devel zlib-devel perl)
+      OPT=(libaio1 ncurses-devel) ;;
+  esac
+
+  # RHEL clones ship oniguruma-devel in CRB and re2c/libzip-devel in EPEL
+  if [[ $FAMILY == fedora && $OSID != fedora ]]; then
+    say "enabling EPEL + CRB"
+    $SUDO dnf install -y epel-release dnf-plugins-core || warn "epel-release failed"
+    $SUDO dnf config-manager --set-enabled crb 2>/dev/null || $SUDO dnf config-manager --set-enabled powertools 2>/dev/null || true
+  fi
+  if [[ $FAMILY == debian ]]; then $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update; fi
+
+  local nginx_was_active=0
+  if (( ! DEPS_ONLY )) && systemctl is-active --quiet nginx 2>/dev/null; then nginx_was_active=1; fi
+
+  say "installing packages"
+  pkg_install "${CORE[@]}"
+  local p
+  for p in "${OPT[@]}"; do pkg_install "$p" >/dev/null 2>&1 || warn "optional package '$p' not installed (ignore if unavailable)"; done
+  (( DEPS_ONLY )) && return 0
+
+  # vela runs its own user-level nginx on 80/443; a system one must be off
+  if systemctl is-active --quiet nginx 2>/dev/null; then
+    if (( nginx_was_active )); then
+      (( YES )) && die "system nginx.service is running and holds port 80. Stop it yourself, or rerun without --yes."
+      ask "System nginx is running and uses port 80. Stop and disable it?" n || die "aborted: free port 80 and rerun."
+    fi
+    $SUDO systemctl disable --now nginx
+  fi
+}
+ensure_mise() {
+  if ! have mise; then say "installing mise"; curl -fsSL https://mise.run | sh; fi
+  local m; m=$(command -v mise)
+  add_activation() { # shell rcfile
+    local sh=$1 rc=$2
+    have "$sh" || return 0
+    if [[ -f $rc ]] && grep -q 'mise activate' "$rc"; then return 0; fi
+    mkdir -p "$(dirname "$rc")"
+    if [[ $sh == fish ]]; then printf '%s activate fish | source\n' "$m" >"$rc"
+    else printf 'eval "$(%s activate %s)"\n' "$m" "$sh" >>"$rc"; fi
+    say "mise activation added to $rc"
+  }
+  add_activation bash "$HOME/.bashrc"
+  add_activation zsh  "$HOME/.zshrc"
+  add_activation fish "$HOME/.config/fish/conf.d/mise.fish"
+}
+
+# ---- PHP: CVE-2026-109618 / CVE-2026-109619 ("PHP2Shell", unauthenticated RCE, actively exploited).
+# Fixed 2026-10-21 in 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12; 8.1 and older get no upstream fix.
+# https://www.tenable.com/blog/php2shell-cve-2026-109618-cve-2026-109619-frequently-asked-questions-about-critical-php-remote
+php_cve_fixed() { case $1 in 8.2) echo 8.2.35 ;; 8.3) echo 8.3.36 ;; 8.4) echo 8.4.27 ;; 8.5) echo 8.5.12 ;; esac; }
+ver_lt() { [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1) == "$1" ]]; }
+php_cve_status() { # ver (8.4 or 8.4.20) -> prints a reason when affected, nothing when safe
+  local v=$1 mm fixed target
+  mm=${v%.*}; [[ $v =~ ^[0-9]+\.[0-9]+$ ]] && mm=$v
+  if ver_lt "$mm" 8.2; then echo "PHP $mm no longer gets upstream security fixes and has no patch for these CVEs"; return; fi
+  fixed=$(php_cve_fixed "$mm"); [[ -n $fixed ]] || return 0
+  target=$v; [[ $v =~ ^[0-9]+\.[0-9]+$ ]] && target=$(mise latest "php@$v" 2>/dev/null || true)
+  [[ -n $target ]] || return 0
+  if ver_lt "$target" "$fixed"; then echo "PHP $target is affected; fixed in $fixed"; fi
+}
+php_cve_confirm() { # ver -> 0 to proceed
+  local why; why=$(php_cve_status "$1")
+  [[ -n $why ]] || return 0
+  warn "$why."
+  warn "CVE-2026-109618 and CVE-2026-109619 (PHP2Shell) are unauthenticated remote code execution bugs, actively exploited (CISA KEV)."
+  warn "vela only listens on 127.0.0.1, which limits exposure, but an affected PHP is still unsafe to run."
+  ask "Install PHP $1 anyway?" n
+}
+php_cve_scan() { # warn about already-installed affected versions
+  local v why
+  for v in $(mise ls php 2>/dev/null | awk '$1=="php"{print $2}'); do
+    why=$(php_cve_status "$v"); [[ -z $why ]] || warn "installed: $why (CVE-2026-109618/109619)"
+  done
+}
+choose_php() { # flag value or "ask" -> PHPS (first = global default)
+  PHPS=()
+  if [[ $1 != ask ]]; then IFS=, read -r -a PHPS <<<"$1"; return 0; fi
+  local -a opts=("8.5" "8.4" "8.3" "8.2" "8.1 (older: no upstream security fixes, may fail to build)") rest=()
+  local i p def
+  if ! menu multi "PHP versions to install, each compiles 5-10 min (select none to skip)" "${opts[@]}"; then PHPS=(8.5); return 0; fi
+  for i in $MENU_SEL; do PHPS+=("${opts[i]%% *}"); done
+  if (( ${#PHPS[@]} > 1 )) && menu one "Global default PHP" "${PHPS[@]}"; then
+    def=${PHPS[MENU_SEL]}
+    for p in "${PHPS[@]}"; do [[ $p == "$def" ]] || rest+=("$p"); done
+    PHPS=("$def" "${rest[@]}")
+  fi
+}
+
+cmd_install() {
+  local php=ask node=ask xdebug=ask addons=ask a v
+  for a in "$@"; do
+    case $a in
+      --php=*) php=${a#--php=} ;; --node=*) node=${a#--node=} ;;
+      --xdebug=*) xdebug=${a#--xdebug=} ;; --addons=*) addons=${a#--addons=} ;;
+      --yes) YES=1 ;;
+      --deps-only) DEPS_ONLY=1 ;;
+      *) die "unknown option: $a" ;;
+    esac
+  done
+  SUDO=sudo
+  if (( EUID == 0 )); then
+    (( DEPS_ONLY )) || die "do not run as root; sudo is used where needed."
+    SUDO=""
+  else
+    have sudo || die "sudo not found."
+  fi
+  if (( ! DEPS_ONLY )); then
+    [[ -d /run/systemd/system ]] || die "systemd is required (no /run/systemd/system)."
+    sc show-environment >/dev/null 2>&1 || die "no systemd user session"
+  fi
+  install_deps
+  if (( DEPS_ONLY )); then say "deps done"; return 0; fi
+  ensure_mise
+  mkdir -p "$CONF" "$DATA" "$STATE"
+  write_units
+  system_setup
+
+  say "TLS: mkcert"
+  mise use -g mkcert@latest
+  mkc -install
+
+  mkdir -p "$HOME/Vela"; touch "$CONF/parked"
+  grep -qxF "$HOME/Vela" "$CONF/parked" || echo "$HOME/Vela" >>"$CONF/parked"
+
+  choose_php "$php"
+  if (( ${#PHPS[@]} == 0 )); then say "no PHP selected (later: vela php:install 8.5)"; fi
+  for v in "${PHPS[@]}"; do
+    if [[ -n $(php_prefix "$v") ]]; then say "PHP $v already installed"
+    else php_install "$v" || warn "PHP $v not installed"; fi
+  done
+  php=${PHPS[0]:-}
+  if [[ -n $php && -n $(php_prefix "$php") ]]; then mise use -g "php@$php"; else php=""; fi
+
+  case $node in
+    skip) ;;
+    lts) mise use -g node@lts ;;
+    ask) if node_present; then say "Node detected, leaving it as is"
+         elif ask "Install Node.js LTS via mise?" y; then mise use -g node@lts
+         else say "skipped Node (later: mise use -g node@lts)"; fi ;;
+  esac
+  if [[ -n $php ]]; then
+    case $xdebug in
+      yes) cmd_xdebug_install "$php" ;;
+      no) ;;
+      ask) ask "Install Xdebug for PHP $php?" n && cmd_xdebug_install "$php" || say "skipped Xdebug (later: vela xdebug:install)" ;;
+    esac
+  fi
+
+  sc daemon-reload
+  sc enable vela.target vela-nginx.service >/dev/null
+  if [[ $(cat "$CONF/dns-mode") == resolved ]]; then sc enable vela-dns.service >/dev/null; fi
+  sc start vela.target
+  if [[ -n $(global_php) ]]; then
+    cmd_regen
+    sc enable --now vela-sites.path >/dev/null
+  else
+    warn "no PHP installed, so no sites are served yet. Run: vela php:install 8.5"
+  fi
+
+  install_addons "$addons"
+  if [[ -n $php ]] && ! have php; then   # a script cannot change its parent shell: tell the user how
+    local sh; sh=$(basename "${SHELL:-bash}")
+    warn "this terminal does not have mise loaded yet, so 'php' and 'vela' tools are not found here."
+    warn "load it now with:  exec $sh     (or just open a new terminal)"
+  fi
+  say "done. Try: mkdir ~/Vela/hello && echo '<?php echo PHP_VERSION;' > ~/Vela/hello/index.php && curl http://hello.$TLD"
+}
+# menu <multi|one> <title> items... -> MENU_SEL (index, or space-separated indices for multi). rc 1 without a tty.
+menu() {
+  local mode=$1 title=$2; shift 2
+  local -a items=("$@") on=()
+  local n=${#items[@]} cur=0 i k rest ptr mark hint="up/down move, enter confirm"
+  (( YES )) && return 1
+  { exec 8</dev/tty 7>/dev/tty; } 2>/dev/null || return 1
+  [[ $mode == multi ]] && hint="up/down move, space select, enter confirm"
+  printf '%s  (%s)\n' "$title" "$hint" >&7
+  while :; do
+    for i in "${!items[@]}"; do
+      ptr=" "; if (( i == cur )); then ptr=">"; fi
+      mark=""
+      if [[ $mode == multi ]]; then mark="[ ]"; if [[ ${on[i]:-0} == 1 ]]; then mark="[x]"; fi; fi
+      printf '\r\033[K %s %s %s\n' "$ptr" "$mark" "${items[i]}" >&7
+    done
+    IFS= read -rsn1 k <&8 || break
+    case $k in
+      $'\e') rest=""; read -rsn2 -t 0.05 rest <&8 || true
+             case $rest in
+               '[A') if (( cur > 0 )); then cur=$((cur-1)); fi ;;
+               '[B') if (( cur < n-1 )); then cur=$((cur+1)); fi ;;
+             esac ;;
+      k) if (( cur > 0 )); then cur=$((cur-1)); fi ;;
+      j) if (( cur < n-1 )); then cur=$((cur+1)); fi ;;
+      ' ') if [[ $mode == multi ]]; then on[cur]=$(( 1 - ${on[cur]:-0} )); fi ;;
+      '') break ;;
+    esac
+    printf '\033[%dA' "$n" >&7
+  done
+  printf '\033[J' >&7
+  MENU_SEL=$cur
+  if [[ $mode == multi ]]; then
+    MENU_SEL=""; for i in "${!items[@]}"; do if [[ ${on[i]:-0} == 1 ]]; then MENU_SEL+="$i "; fi; done
+  fi
+  exec 8<&- 7>&-
+}
+pick_addons() {
+  local -a labels=() svcs vers
+  read -r -a svcs <<<"$SVCS"
+  local s idx rt via ver
+  rt=$(runtime_avail)
+  for s in "${svcs[@]}"; do
+    svc_meta "$s"; labels+=("$(printf '%-12s default %-11s port %s' "$s" "${SV_VERS%% *}" "$SV_PORT")")
+  done
+  menu multi "Addons to install (select none to skip)" "${labels[@]}" || return 1
+  [[ -n $MENU_SEL ]] || { say "no addons selected (later: vela service:add)"; return 0; }
+  for idx in $MENU_SEL; do
+    s=${svcs[idx]}; svc_meta "$s"
+    read -r -a vers <<<"$SV_VERS"
+    if [[ $SV_SRC == mise:* ]]; then vers+=("other..."); fi
+    menu one "$s version" "${vers[@]}" || return 1
+    ver=${vers[MENU_SEL]}
+    if [[ $ver == "other..." ]]; then
+      tty_read "  $s version (e.g. 16.4): " && ver=$REPLY || ver=${SV_VERS%% *}
+    fi
+    via=native
+    if [[ -n $rt && $s != minio ]]; then
+      menu one "$s install method" "native" "container ($rt)" || return 1
+      if (( MENU_SEL == 1 )); then via=$rt; fi
+    fi
+    cmd_svc_add "$s" "$ver" --via "$via" || warn "addon $s failed; retry with: vela service:add $s"
+  done
+}
+install_addons() { # ask | none | svc[@ver][:via],...
+  local spec=$1 toks=() t svc ver via
+  [[ $spec == none ]] && return 0
+  if [[ $spec == ask ]]; then pick_addons || true; return 0; fi
+  IFS=, read -r -a toks <<<"$spec"
+  for t in "${toks[@]}"; do
+    via=native; if [[ $t == *:* ]]; then via=${t##*:}; t=${t%:*}; fi
+    svc=${t%%@*}; ver=""; if [[ $t == *@* ]]; then ver=${t#*@}; fi
+    svc_meta "$svc" || { warn "unknown addon '$svc'"; continue; }
+    cmd_svc_add "$svc" ${ver:+"$ver"} --via "$via" || warn "addon $t failed; continue with: vela service:add $svc"
+  done
+}
+cmd_uninstall() {
+  local purge=0; [[ ${1:-} == --purge ]] && purge=1
+  sc stop vela.target 2>/dev/null || true
+  local f
+  for f in "$CONF"/services/*.env; do sc disable --now "vela-svc@$(basename "$f" .env)" 2>/dev/null || true; done
+  sc disable vela.target vela-nginx.service vela-sites.path vela-dns.service 2>/dev/null || true
+  rm -f "$UNITS"/vela*.{service,path,target}; rm -rf "$UNITS"/vela*.wants
+  sc daemon-reload
+  if [[ -f $CONF/system-files ]]; then
+    sudo systemctl disable --now vela-dns-link.service 2>/dev/null || true
+    sudo ip link del vela0 2>/dev/null || true
+    while IFS= read -r f; do [[ -n $f ]] && sudo rm -f "$f"; done <"$CONF/system-files"
+    sudo systemctl daemon-reload
+    [[ -f /etc/NetworkManager/conf.d/vela.conf ]] || ! [[ $(cat "$CONF/dns-mode" 2>/dev/null) == nm ]] || sudo systemctl restart NetworkManager
+  fi
+  if (( purge )); then rm -rf "$CONF" "$DATA" "$STATE"; say "purged config, data and state (mise tools kept)"
+  else say "removed units and system files; config and addon data kept (--purge deletes them)"; fi
+}
+cmd_status() {
+  local u
+  for u in vela.target vela-nginx vela-dns vela-sites.path; do printf '%-18s %s\n' "$u" "$(sc is-active "$u" 2>/dev/null || true)"; done
+  for u in $(sc list-units --plain --no-legend 'vela-fpm@*' 'vela-svc@*' 2>/dev/null | awk '{print $1}'); do
+    printf '%-18s %s\n' "$u" "$(sc is-active "$u" 2>/dev/null || true)"
+  done
+}
+
+usage() {
+  cat <<'EOF'
+vela: Herd-like Laravel dev environment (nginx + php-fpm + .test DNS, versions via mise)
+
+sites     park [dir] | forget [dir] | parked | link [name] [--secure] | unlink [name] | links
+          sites | secure [name] | unsecure [name] | isolate <ver> [--site=n] | unisolate [--site=n]
+          use <ver> | open [name]
+php       php:install <ver> | php:list (warns on CVE-affected versions) | xdebug:install [ver] | xdebug:remove [ver]
+addons    service:available | service:add <svc> [ver] [--via native|podman|docker] [--port N] [--user U] [--password P]
+          service:list | service:default <id> | service:start|stop|restart <id> | service:remove <id> [--purge] | service:logs <id>
+lifecycle install [--deps-only] [--php=8.5,8.4] [--node=ask|lts|skip] [--xdebug=ask|yes|no] [--addons=ask|none|svc@ver[:via],...] [--yes]
+          uninstall [--purge] | start | stop | restart | status | regen
+EOF
+}
+
+main() {
+  local cmd=${1:-help}; shift || true
+  case $cmd in
+    help|-h|--help) usage; return ;;
+    fpm-run)   fpm_run "$@" ;;
+    nginx-run) local ng; ng=$(find_bin nginx) || die "nginx not found"
+               mkdir -p "$RUN" "$STATE/nginx"/{body,proxy,fastcgi,uwsgi,scgi}
+               exec "$ng" -p "$STATE/nginx" -c "$CONF/nginx/nginx.conf" -e stderr -g 'daemon off;' ;;
+    dns-run)   dns_run ;;
+    service)   [[ ${1:-} == run ]] && { shift; cmd_svc_run "$@"; } || die "usage: vela service run <id>" ;;
+  esac
+  case $cmd in install|uninstall) ;; *) have mise || die "mise not found; run: vela install" ;; esac
+  case $cmd in
+    regen) cmd_regen "$@" ;;
+    park) cmd_park "$@" ;;       forget) cmd_forget "$@" ;;
+    parked) parked_dirs ;;
+    link) cmd_link "$@" ;;       unlink) cmd_unlink "$@" ;;      links) cmd_links ;;
+    sites) cmd_sites ;;          open) cmd_open "$@" ;;
+    secure) cmd_secure "$@" ;;   unsecure) cmd_unsecure "$@" ;;
+    isolate) cmd_isolate "$@" ;; unisolate) cmd_unisolate "$@" ;;
+    use) [[ ${1:-} =~ ^[0-9]+\.[0-9]+$ ]] || die "usage: vela use <major.minor>"
+         [[ -n $(php_prefix "$1") ]] || php_install "$1"
+         mise use -g "php@$1"; cmd_regen ;;
+    php:install) php_install "${1:?usage: vela php:install <ver>}"; cmd_regen ;;
+    php:list) mise ls php; php_cve_scan ;;
+    xdebug:install) cmd_xdebug_install "$@" ;;  xdebug:remove) cmd_xdebug_remove "$@" ;;
+    service:available) cmd_svc_available ;;
+    service:add) if (( $# )); then cmd_svc_add "$@"; else pick_addons || die "the picker needs a terminal; usage: vela service:add <svc> [ver]"; fi ;;  service:default|service:link) svc_expose "${1:?usage: vela service:default <id>}" ;;
+    service:list) cmd_svc_list ;;  service:remove) cmd_svc_remove "$@" ;;
+    service:start|service:stop|service:restart)
+      sc "${cmd#service:}" "vela-svc@${1:?usage: vela $cmd <id>}" ;;
+    service:logs) journalctl --user -u "vela-svc@${1:?usage: vela service:logs <id>}" -n 100 -f ;;
+    install) cmd_install "$@" ;;  uninstall) cmd_uninstall "$@" ;;
+    start) sc start vela.target ;;  stop) sc stop vela.target ;;  restart) sc restart vela.target ;;
+    status) cmd_status ;;
+    *) usage; exit 1 ;;
+  esac
+}
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
