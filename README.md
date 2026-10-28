@@ -18,6 +18,8 @@ PHP 8.2 to 8.5 must be at least 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 to be safe fro
 
 ## Use
 
+Full guide: [USAGE.md](USAGE.md).
+
     cd ~/Vela && laravel new blog     # http://blog.test, no command needed
     cd ~/code/app && vela link        # http://app.test
     vela secure app                   # https via mkcert
