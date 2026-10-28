@@ -60,4 +60,8 @@ cp "$C/nginx/sites/b.conf" "$T/b.before"; mkdir "$T/parked/new"
 if STUB_NGINX_FAIL=1 "$VELA" regen --quiet 2>/dev/null; then fail "regen ignored nginx -t failure"; fi
 [[ ! -e $C/nginx/sites/new.conf ]] || fail "bad config was installed"
 "$VELA" regen --quiet; [[ -f $C/nginx/sites/new.conf ]] || fail "new site not picked up"
+mkdir -p "$T/proj/app" "$T/proj/config"; touch "$T/proj/artisan"
+if "$VELA" park "$T/proj" 2>/dev/null; then fail "park accepted a project root"; fi
+echo "$T/proj" >>"$C/parked"; "$VELA" regen --quiet 2>/dev/null
+[[ ! -e $C/nginx/sites/app.conf && ! -e $C/nginx/sites/config.conf ]] || fail "project subfolders served as sites"
 echo "regen tests passed"

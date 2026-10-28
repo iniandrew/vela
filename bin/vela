@@ -112,12 +112,16 @@ site_slug() { # dirname -> hostname label, or fail
   [[ $s =~ ^[a-z0-9][a-z0-9._-]*$ ]] || return 1
   echo "$s"
 }
+is_project() { # a single app (not a folder of apps)
+  [[ -f $1/artisan || -f $1/composer.json || -f $1/public/index.php || -f $1/index.php ]]
+}
 parked_dirs() { [[ -f $CONF/parked ]] && cat "$CONF/parked" || true; }
 load_sites() {
   SITE_PATH=()
   local d p n l
   while IFS= read -r d; do
     [[ -n $d && -d $d ]] || continue
+    if is_project "$d"; then warn "$d is a project, not a folder of projects; skipping it (use: cd $d && vela forget && vela link)"; continue; fi
     for p in "$d"/*/; do
       p=${p%/}
       n=$(site_slug "${p##*/}") || continue
@@ -183,6 +187,7 @@ error_log stderr warn;
 events { worker_connections 1024; }
 http {
   $mime
+  types_hash_max_size 4096;
   default_type application/octet-stream;
   access_log off;
   sendfile on;
@@ -294,7 +299,13 @@ cmd_regen() {
     sc is-enabled --quiet "vela-fpm@$v" 2>/dev/null || sc enable "vela-fpm@$v" >/dev/null 2>&1 || true
     (( up )) && ! sc is-active --quiet "vela-fpm@$v" && sc start "vela-fpm@$v" || true
   done
-  (( changed && up )) && sc reload vela-nginx 2>/dev/null || true
+  if (( up )); then
+    if sc is-active --quiet vela-nginx; then
+      if (( changed )); then sc reload vela-nginx 2>/dev/null || true; fi
+    else
+      sc start vela-nginx 2>/dev/null || warn "nginx is not running and failed to start: journalctl --user -u vela-nginx"
+    fi
+  fi
 
   local pu; pu=$(render_path_unit)
   if [[ $pu != "$(cat "$UNITS/vela-sites.path" 2>/dev/null || true)" ]]; then
@@ -307,6 +318,7 @@ cmd_regen() {
 
 cmd_park() {
   local d; d=$(readlink -f "${1:-$PWD}"); [[ -d $d ]] || die "not a directory: $d"
+  is_project "$d" && die "$d is a project. 'park' serves every subfolder as its own site; use 'vela link' for a single project."
   mkdir -p "$CONF"; touch "$CONF/parked"
   grep -qxF "$d" "$CONF/parked" || echo "$d" >>"$CONF/parked"
   cmd_regen
@@ -759,7 +771,8 @@ PartOf=vela.target
 [Service]
 ExecStart=$SELF_UNIT_BIN nginx-run
 ExecReload=/bin/kill -HUP \$MAINPID
-Restart=on-failure
+Restart=always
+RestartSec=1
 [Install]
 WantedBy=vela.target
 EOF
@@ -1080,11 +1093,13 @@ cmd_install() {
   sc daemon-reload
   sc enable vela.target vela-nginx.service >/dev/null
   if [[ $(cat "$CONF/dns-mode") == resolved ]]; then sc enable vela-dns.service >/dev/null; fi
-  sc start vela.target
   if [[ -n $(global_php) ]]; then
-    cmd_regen
+    cmd_regen                      # writes nginx.conf before nginx first starts
+    sc start vela.target
+    cmd_regen --quiet              # target is up now: start/reload nginx and fpm
     sc enable --now vela-sites.path >/dev/null
   else
+    sc start vela.target
     warn "no PHP installed, so no sites are served yet. Run: vela php:install 8.5"
   fi
 
