@@ -24,10 +24,10 @@ vela serves your local projects at `https://<name>.test` using nginx, PHP-FPM an
 
 `install.sh` puts the `vela` command on your PATH and runs `vela install`, which:
 
-1. detects your distro and installs packages (nginx, dnsmasq, PHP build libraries);
+1. detects your distro and installs the packages vela needs (nginx, dnsmasq, ...), skipping any tool you already have. Build libraries are installed only when something gets compiled (a mise PHP, or a source-built addon such as Postgres or Redis);
 2. installs mise and adds its activation to bash, zsh and fish;
-3. sets up `.test` DNS, ports 80/443 for an unprivileged nginx, and a local certificate authority (mkcert);
-4. asks which PHP versions to compile (each takes 5 to 10 minutes) and which one is the global default;
+3. sets up `.test` DNS, ports 80/443 for an unprivileged nginx, and a local certificate authority (mkcert, unless you already have it);
+4. if you already have PHP (from your distro, Homebrew, asdf or phpenv), offers to use it instead of compiling, after warning you if that version has known security holes. Otherwise it asks which PHP versions to compile (each takes 5 to 10 minutes) and which one is the global default. See [Using your system PHP](#using-your-system-php);
 5. asks about Node (skipped if you already have node or nvm), Xdebug and addons.
 
 Everything optional can be added later. Rerun `vela install` at any time; it is safe to repeat.
@@ -35,12 +35,12 @@ Everything optional can be added later. Rerun `vela install` at any time; it is 
 Useful flags (accepted by `install.sh` and `vela install`):
 
 ```
---php=8.5,8.4        versions to compile, first one is the default
+--php=8.5,8.4        versions to compile, first one is the default (skips the system PHP check)
 --node=ask|lts|skip
 --xdebug=ask|yes|no
 --addons=ask|none|postgres@17,redis:podman
---yes                no prompts, take the defaults (PHP 8.5, no Xdebug, no addons)
---deps-only          only install distro packages
+--yes                no prompts, take the defaults (your own PHP if you have one and it is not affected by known CVEs, else PHP 8.5; no Xdebug, no addons)
+--deps-only          only install distro packages, build libraries included
 ```
 
 **After the install, your current terminal does not know about mise yet.** Run `exec fish` (or `exec zsh` / `exec bash`), or open a new terminal. Until then `php` and the addon client tools are "command not found".
@@ -119,6 +119,29 @@ vela php:ext redis [ver]        # install and enable a PECL extension (defaults 
 **Extensions.** Builds include the common Laravel extensions (list below). For anything else, `vela php:ext <name> [ver]` builds it through PECL, writes `conf.d/<name>.ini` and restarts that version's PHP-FPM. It does nothing if the extension is already loaded. There is no `php.ini` to edit: extensions are enabled by `.ini` files in the PHP version's `conf.d` directory (`$(mise where php@8.5)/conf.d`), and you can put your own settings there too.
 
 Installed PHP builds include: bcmath, curl, gd, intl, mbstring, mysqli and pdo_mysql, pdo_pgsql, pdo_sqlite, sodium, openssl, zip, xsl, gmp, bz2, soap, sockets, pcntl and opcache, plus composer.
+
+### Using your system PHP
+
+If you already installed PHP yourself, vela can serve sites with it instead of compiling its own. It looks in these places:
+
+- your distro: `/usr/bin/php` plus its `php-fpm` package
+- Homebrew: `/home/linuxbrew/.linuxbrew/opt/php` and `php@8.x` (or `$HOMEBREW_PREFIX`, or `~/.linuxbrew`)
+- asdf: `~/.asdf/installs/php/<version>` (or `$ASDF_DATA_DIR`)
+- phpenv: `~/.phpenv/versions/<version>` (or `$PHPENV_ROOT`)
+
+```
+vela use system                 # use a PHP you installed; asks which one if there are several
+vela use 8.5                    # back to a mise-compiled PHP
+vela php:list                   # mise versions, then the ones vela found elsewhere
+```
+
+vela serves PHP through php-fpm, so the PHP you pick needs one. Homebrew and the asdf PHP plugin build it by default. With phpenv, make sure your build includes it (`sbin/php-fpm` in the version's folder). For the distro PHP, vela needs the `php-fpm` package, plus the extensions Laravel uses (pdo_sqlite, pdo_mysql, pdo_pgsql, intl, gd, zip, bcmath, sodium, openssl, mbstring, curl, dom) and composer. `vela install` and `vela use system` list whatever is missing and offer to install it with your package manager (for example `php-fpm php-intl` on Arch, `php8.4-fpm php8.4-mysql` on Debian/Ubuntu). On Arch, extensions that ship inside the `php` package but are turned off are enabled in a `vela.ini` in PHP's `conf.d` directory, which `vela uninstall` removes again.
+
+For Homebrew, asdf and phpenv, vela warns about missing extensions but leaves installing them to that tool.
+
+vela picks the global PHP in this order: the mise global version, then a PHP you installed (the one chosen with `vela use system` first, then distro, Homebrew, asdf, phpenv; only ones that have php-fpm), then the newest PHP mise has installed. `vela php:ext <name>` on the distro PHP installs the distro package (for example `php-redis`) instead of building it with PECL. On Homebrew, asdf or phpenv PHP, install extensions with that tool. Xdebug for your own PHP comes from your distro's xdebug package (or pecl for Homebrew, asdf, phpenv); `vela xdebug:install` only handles mise builds. `vela isolate` still uses mise versions.
+
+**Security.** vela checks your own PHP's version against the PHP2Shell fixes (see the security note above). If it is older, `vela install`, `vela use system`, `vela link` and other site commands, and `vela php:list` warn you and suggest `vela php:install <ver> && vela use <ver>`. `vela install` and `vela use system` then ask before using it, defaulting to no. Distros sometimes backport a fix without changing the version number, so check your distro's security tracker before trusting or dismissing the warning.
 
 ## Xdebug
 
@@ -263,6 +286,8 @@ vela service:logs <id>
 **`.test` does not resolve.** Check `resolvectl query anything.test`; it should answer `127.0.0.1`. If not, `systemctl status vela-dns-link` and `vela status`. Leftovers from another local-dev tool (such as Lerd) that point DNS at a dead local server can break this; look at `resolvectl status` for stray `127.0.0.1:5300` entries.
 
 **One project shows up as many sites (`app.test`, `config.test`, ...).** You ran `vela park` inside the project. Run `vela forget` there, then `vela link`.
+
+**`error: no PHP installed` although `php` works.** vela serves PHP through php-fpm, from a mise build or from a PHP you installed (distro, Homebrew, asdf, phpenv). If your PHP comes from the distro, run `vela use system`: it installs the missing `php-fpm` package and extensions after asking. A Homebrew, asdf or phpenv PHP without `sbin/php-fpm` must be rebuilt with fpm enabled. Otherwise, use `vela php:install 8.5`. PHP from other places is not detected.
 
 **The wrong PHP version is used.** `vela sites` shows the version per site. Set one with `vela isolate <ver>`, or change the default with `vela use <ver>`. A version recorded in a project's mise config that is not installed falls back to the global version.
 

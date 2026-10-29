@@ -9,8 +9,8 @@ touch "$T/parked/a/.php84"   # stub mise reads this marker as "site wants 8.4"
 cat >"$T/bin/mise" <<STUB
 #!/usr/bin/env bash
 case \$1 in
-  where) v=\${2#php@}; [[ -d $T/php/\$v ]] && echo $T/php/\$v || exit 1 ;;
-  current) [[ -e .php84 ]] && echo 8.4.1 || echo 8.5.12 ;;
+  where) v=\${2#php@}; [[ \${STUB_NO_MISE_PHP:-0} != 1 && -d $T/php/\$v ]] && echo $T/php/\$v || exit 1 ;;
+  current) [[ \${STUB_NO_MISE_PHP:-0} == 1 ]] && exit 0; [[ -e .php84 ]] && echo 8.4.1 || echo 8.5.12 ;;
   which) echo $T/bin/mkcert ;;
 esac
 STUB
@@ -64,4 +64,32 @@ mkdir -p "$T/proj/app" "$T/proj/config"; touch "$T/proj/artisan"
 if "$VELA" park "$T/proj" 2>/dev/null; then fail "park accepted a project root"; fi
 echo "$T/proj" >>"$C/parked"; "$VELA" regen --quiet 2>/dev/null
 [[ ! -e $C/nginx/sites/app.conf && ! -e $C/nginx/sites/config.conf ]] || fail "project subfolders served as sites"
+
+# no mise PHP: fall back to the distro PHP and its php-fpm (7.9 so a real one never matches)
+mkdir -p "$T/sys"
+printf '#!/usr/bin/env bash\necho 7.9.1\n' >"$T/sys/php"
+cat >"$T/sys/php-fpm" <<'STUB'
+#!/usr/bin/env bash
+[[ $1 == -v ]] && { echo "PHP 7.9.1 (fpm-fcgi)"; exit 0; }
+echo "fpm $*"
+STUB
+chmod +x "$T"/sys/*
+export STUB_NO_MISE_PHP=1 VELA_SYS_PHP=$T/sys/php HOMEBREW_PREFIX=$T/nobrew
+unset ASDF_DATA_DIR PHPENV_ROOT
+"$VELA" regen --quiet
+has "$C/nginx/sites/b.conf" 'php-7.9.sock'
+[[ $("$VELA" fpm-run 7.9) == "fpm --nodaemonize --fpm-config $C/fpm/7.9.conf" ]] || fail "fpm-run did not use the system php-fpm"
+rm "$T/sys/php-fpm"
+err=$("$VELA" regen --quiet 2>&1) && fail "regen succeeded without any php-fpm"
+[[ $err == *"vela use system"* ]] || fail "missing php-fpm error does not mention 'vela use system': $err"
+list=$("$VELA" php:list 2>&1)
+[[ $list == *"7.9.1"*distro* && $list == *PHP2Shell* && $list == *"vela php:install 8.5"* ]] || fail "php:list does not flag the old system PHP: $list"
+
+# asdf PHP (one prefix per version) is used when the distro PHP has no php-fpm
+a=$T/home/.asdf/installs/php/8.3.6; mkdir -p "$a/bin" "$a/sbin"
+printf '#!/usr/bin/env bash\necho 8.3.6\n' >"$a/bin/php"
+printf '#!/usr/bin/env bash\necho "asdf-fpm $*"\n' >"$a/sbin/php-fpm"; chmod +x "$a/bin/php" "$a/sbin/php-fpm"
+"$VELA" regen --quiet
+has "$C/nginx/sites/b.conf" 'php-8.3.sock'
+[[ $("$VELA" fpm-run 8.3) == "asdf-fpm --nodaemonize --fpm-config $C/fpm/8.3.conf" ]] || fail "fpm-run did not use the asdf php-fpm"
 echo "regen tests passed"
