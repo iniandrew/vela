@@ -10,7 +10,7 @@ Supports systemd distros: Arch family, Debian/Ubuntu, Fedora/RHEL, openSUSE.
     curl -fsSL https://raw.githubusercontent.com/iniandrew/vela/main/install.sh | bash
 
 `install.sh` only fetches `vela` and puts it on your PATH, then runs `vela install`, which does the real work:
-distro packages (Arch, Debian/Ubuntu, Fedora/RHEL, openSUSE), mise, nginx/DNS/TLS setup, then asks which PHP versions to compile, plus Node, Xdebug and addons. Rerun `vela install` any time.
+distro packages (Arch, Debian/Ubuntu, Fedora/RHEL, openSUSE), mise, nginx/DNS/TLS setup, then asks which PHP versions to compile (or uses a PHP you already have from your distro, Homebrew, asdf or phpenv: `vela use system`, with a warning if it is affected by the PHP2Shell CVEs), plus Node, Xdebug and addons. Tools you already have are left alone. Rerun `vela install` any time.
 
 Flags (accepted by both): `--php=8.5,8.4` (first = default) `--node=ask|lts|skip` `--xdebug=ask|yes|no` `--addons=ask|none|postgres@17,redis:podman` `--yes` `--deps-only`.
 

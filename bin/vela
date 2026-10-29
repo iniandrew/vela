@@ -57,10 +57,52 @@ mkc() { # mkcert, wherever it lives (mise global, or PATH)
 }
 
 # ---- PHP -------------------------------------------------------------------
+PHP_EXTS="pdo_sqlite pdo_mysql pdo_pgsql intl gd zip bcmath sodium openssl mbstring curl dom"
+SYS_PHP=${VELA_SYS_PHP:-/usr/bin/php}   # distro PHP, served through its own php-fpm
 php_prefix() { mise where "php@$1" 2>/dev/null || true; }
-global_php() {
+mise_phps() { mise ls --installed php 2>/dev/null | awk '$1=="php"{split($2,a,"."); print a[1]"."a[2]}' | sort -uV; }
+mise_global_php() {
   local v; v=$(cd "$HOME" && mise current php 2>/dev/null </dev/null | awk '{print $1}') || v=""
   echo "${v%.*}"
+}
+sys_php_full() { if [[ -x $SYS_PHP ]]; then "$SYS_PHP" -r 'echo PHP_VERSION;' 2>/dev/null || true; fi; }
+sys_fpm() { # ver -> distro php-fpm for that major.minor (Arch/Fedora php-fpm, Debian php-fpm8.4)
+  local f
+  for f in "${SYS_PHP%/*}"/php-fpm* /usr/sbin/php-fpm*; do
+    [[ -x $f && $("$f" -v 2>/dev/null) =~ ^PHP\ ([0-9]+\.[0-9]+) && ${BASH_REMATCH[1]} == "$1" ]] && { echo "$f"; return 0; }
+  done
+  return 1
+}
+prefix_phps() { # source dir... -> ext_phps lines for one-prefix-per-version installs (bin/php, sbin/php-fpm)
+  local src=$1 d full fpm; shift
+  for d in "$@"; do
+    [[ -x $d/bin/php ]] || continue
+    full=$(readlink -f "$d"); full=${full##*/}; full=${full%_*}   # dir is the version (brew Cellar: 8.4.5_1)
+    [[ $full =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue   # shortcut: skips custom-named phpenv builds; run php -r if asked
+    fpm=-; if [[ -x $d/sbin/php-fpm ]]; then fpm=$d/sbin/php-fpm; fi
+    echo "${full%.*} $full $src $d/bin/php $fpm"
+  done
+}
+ext_phps() { # PHP not from mise -> "mm full source php fpm" lines (fpm "-" when missing), `vela use system` pick first
+  local full fpm pick=""
+  if [[ -f $CONF/system-php ]]; then pick=$(<"$CONF/system-php"); fi
+  {
+    full=$(sys_php_full)
+    if [[ -n $full ]]; then fpm=$(sys_fpm "${full%.*}") || fpm=-; echo "${full%.*} $full distro $SYS_PHP $fpm"; fi
+    prefix_phps brew "${HOMEBREW_PREFIX:-/home/linuxbrew/.linuxbrew}"/opt/php{,@*} "$HOME"/.linuxbrew/opt/php{,@*}
+    prefix_phps asdf "${ASDF_DATA_DIR:-$HOME/.asdf}"/installs/php/*
+    prefix_phps phpenv "${PHPENV_ROOT:-$HOME/.phpenv}"/versions/*
+  } | awk -v p="$pick" '$4==p{print; next} {r[++n]=$0} END{for(i=1;i<=n;i++) print r[i]}'
+}
+ext_rec() { # [mm] -> first ext_phps line that has php-fpm (for that major.minor when given)
+  ext_phps | awk -v v="${1:-}" '$5!="-" && (v=="" || $1==v) && !f {print; f=1}' || true
+}
+ext_php() { local r; r=$(ext_rec); echo "${r%% *}"; }
+global_php() { # mise global, else a PHP you installed (with php-fpm), else the newest PHP mise has
+  local v; v=$(mise_global_php)
+  [[ -n $v ]] || v=$(ext_php)
+  [[ -n $v ]] || v=$(mise_phps | tail -n1) || v=""
+  echo "$v"
 }
 site_php() { # path -> major.minor of the PHP that site should use
   local v; v=$(cd "$1" 2>/dev/null && mise current php 2>/dev/null </dev/null | awk '{print $1}') || v=""
@@ -70,12 +112,13 @@ site_php() { # path -> major.minor of the PHP that site should use
 php_install() { # ver
   local v=$1
   php_cve_confirm "$v" || { warn "skipped PHP $v"; return 1; }
+  ensure_build_deps
   say "compiling PHP $v with mise (5-10 min)"
   mise install "php@$v"
   local p; p=$(php_prefix "$v")
   [[ -x $p/sbin/php-fpm ]] || die "php-fpm missing in $p"
   local m; m=$("$p/bin/php" -m)
-  for e in pdo_sqlite pdo_mysql pdo_pgsql intl gd zip bcmath sodium openssl mbstring; do
+  for e in $PHP_EXTS; do
     grep -qix "$e" <<<"$m" || warn "PHP $v lacks extension: $e"
   done
   local f; for f in "$CONF"/services/redis-*.env; do php_ext_install redis "$v" || true; break; done
@@ -99,10 +142,11 @@ clear_env = no
 EOF
 }
 fpm_run() { # ver (called by systemd)
-  local p; p=$(php_prefix "$1")
-  [[ -n $p && -x $p/sbin/php-fpm ]] || die "PHP $1 is not installed"
+  local p fpm; p=$(php_prefix "$1")
+  if [[ -n $p && -x $p/sbin/php-fpm ]]; then fpm=$p/sbin/php-fpm
+  else fpm=$(ext_rec "$1"); fpm=${fpm##* }; [[ -n $fpm ]] || die "PHP $1 is not installed"; fi
   write_fpm_conf "$1"
-  exec "$p/sbin/php-fpm" --nodaemonize --fpm-config "$CONF/fpm/$1.conf"
+  exec "$fpm" --nodaemonize --fpm-config "$CONF/fpm/$1.conf"
 }
 
 # ---- sites -----------------------------------------------------------------
@@ -178,7 +222,7 @@ EOF
 }
 render_nginx_conf() { # dir holding sites/
   local mime=""
-  for m in /etc/nginx/mime.types /usr/share/nginx/mime.types /usr/local/etc/nginx/mime.types; do
+  for m in /etc/nginx/mime.types /usr/share/nginx/mime.types /usr/local/etc/nginx/mime.types /usr/local/nginx/conf/mime.types; do
     [[ -f $m ]] && { mime="include $m;"; break; }
   done
   cat <<EOF
@@ -265,8 +309,14 @@ cmd_regen() {
   mkdir -p "$CONF"/{nginx/sites,certs,links,secure,fpm,services} "$STATE/nginx"/{body,proxy,fastcgi,uwsgi,scgi} "$RUN" "$UNITS"
   exec 9>"$STATE/regen.lock"; flock 9
   local ng; ng=$(find_bin nginx) || die "nginx is not installed"
-  local gv; gv=$(global_php)
-  [[ -n $gv ]] || die "no PHP installed. Run: vela php:install 8.5"
+  local gv r mm full src php; gv=$(global_php)
+  if [[ -z $gv ]]; then   # no prompts here: regen also runs from the vela-sites path unit
+    r=$(ext_phps | awk 'NR==1'); read -r mm full src php _ <<<"$r"
+    [[ $src != distro ]] || die "PHP $full found at $php, but its php-fpm is not installed. Run: vela use system (offers to install it), or: vela php:install 8.5"
+    [[ -z $src ]] || die "PHP $full ($src, $php) has no php-fpm. Rebuild it with fpm enabled, or run: vela php:install 8.5"
+    die "no PHP installed. Run: vela php:install 8.5 (or install your distro's php + php-fpm, then: vela use system)"
+  fi
+  if (( ! quiet )) && [[ -z $(php_prefix "$gv") ]]; then ext_cve_warn "$(ext_rec "$gv")" || true; fi
   local tmp; tmp=$(mktemp -d "$STATE/gen.XXXXXX"); TMPS+=("$tmp")
   mkdir -p "$tmp/sites"
   load_sites
@@ -360,6 +410,33 @@ cmd_isolate() {
   (cd "${SITE_PATH[$n]}" && mise use --env local "php@$ver")
   cmd_regen
 }
+ext_php_choose() { # pick a PHP you installed (distro, brew, asdf, phpenv), set it up, remember it
+  local -a recs=() labels=()
+  local r mm full src php fpm e loaded i=0
+  mapfile -t recs < <(ext_phps)
+  (( ${#recs[@]} )) || { warn "no PHP found outside mise (looked at $SYS_PHP, Homebrew, asdf, phpenv)"; return 1; }
+  if (( ${#recs[@]} > 1 )); then
+    for r in "${recs[@]}"; do
+      read -r mm full src php fpm <<<"$r"
+      labels+=("$full  $src  $php$([[ $fpm != - ]] || echo '  (no php-fpm)')")
+    done
+    if menu one "Which PHP should vela use?" "${labels[@]}"; then i=$MENU_SEL; fi
+  fi
+  read -r mm full src php fpm <<<"${recs[i]}"
+  if ext_cve_warn "${recs[i]}"; then ask "Use PHP $full anyway?" n || return 1; fi
+  if [[ $src == distro ]]; then sys_php_setup "$mm" || return 1
+  elif [[ $fpm == - ]]; then warn "$src PHP $full has no php-fpm; rebuild it with fpm enabled"; return 1
+  else
+    loaded=$("$php" -m)
+    for e in $PHP_EXTS; do grep -qix "$e" <<<"$loaded" || warn "$src PHP $full lacks extension: $e"; done
+  fi
+  mkdir -p "$CONF"; echo "$php" >"$CONF/system-php"
+}
+cmd_use_system() { # global default = a PHP you installed, served by its own php-fpm
+  ext_php_choose || die "kept the current PHP"
+  if [[ -n $(mise_global_php) ]]; then mise unuse -g --no-prune php; fi   # --no-prune keeps the compiled builds
+  cmd_regen
+}
 cmd_unisolate() {
   local name="" a; for a in "$@"; do case $a in --site=*) name=${a#--site=} ;; esac; done
   local n; n=$(site_arg "$name"); require_site "$n"
@@ -382,6 +459,12 @@ cmd_open() { local n; n=$(site_arg "${1:-}"); local s=http; [[ -e $CONF/secure/$
 # ---- PECL extensions (phpredis for the Redis addon) ------------------------
 php_ext_install() { # ext ver -> installs via pecl and enables it in conf.d/<ext>.ini
   local ext=$1 v=$2 p; p=$(php_prefix "$v")
+  if [[ -z $p && -n $v ]]; then
+    case $(ext_rec "$v") in
+      *" distro "*) sys_php_setup "$v" "$ext"; return ;;
+      ?*) warn "PHP $v is not a vela (mise) build; install $ext with the tool that installed it (pecl, brew, asdf, phpenv)"; return 1 ;;
+    esac
+  fi
   [[ -n $p ]] || { warn "PHP $v is not installed"; return 1; }
   if "$p/bin/php" -m | grep -qix "$ext"; then return 0; fi
   say "installing PECL $ext for PHP $v"
@@ -393,14 +476,14 @@ php_ext_install() { # ext ver -> installs via pecl and enables it in conf.d/<ext
 }
 php_redis_all() { # phpredis for every installed PHP (Laravel's default Redis client)
   local v
-  for v in $(mise ls php 2>/dev/null | awk '$1=="php"{split($2,a,"."); print a[1]"."a[2]}' | sort -u); do
+  for v in $(mise_phps) $(ext_php); do
     php_ext_install redis "$v" || true
   done
 }
 
 # ---- xdebug ----------------------------------------------------------------
 cmd_xdebug_install() {
-  local v=${1:-$(global_php)} p; p=$(php_prefix "$v"); [[ -n $p ]] || die "PHP $v not installed"
+  local v=${1:-$(global_php)} p; p=$(php_prefix "$v"); [[ -n $p ]] || die "PHP $v is not a vela (mise) build; for a system PHP, install your distro's xdebug package"
   "$p/bin/pecl" install xdebug
   cat >"$p/conf.d/xdebug.ini" <<'EOF'
 zend_extension=xdebug
@@ -459,6 +542,7 @@ svc_prefix() { # svc ver
 }
 svc_install_native() { # svc ver
   local svc=$1 ver=$2 dest url tag
+  case $SV_SRC in mise:vfox:*|fetch) ensure_build_deps ;; esac   # source builds, or binaries needing libaio/ncurses
   case $SV_SRC in
     mise:*) mise install "${SV_SRC#mise:}@$ver" ;;
     fetch)
@@ -926,7 +1010,9 @@ detect_family() {
   [[ -n $FAMILY ]] || die "unsupported distro '$OSID'. Supported: arch, debian/ubuntu, fedora/rhel, opensuse."
   say "distro family: $FAMILY ($name)"
 }
+APT_FRESH=0
 pkg_install() {
+  if [[ $FAMILY == debian ]] && (( ! APT_FRESH )); then $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update; APT_FRESH=1; fi
   case $FAMILY in
     arch)   $SUDO pacman -S --needed --noconfirm "$@" ;;
     debian) $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" ;;
@@ -934,54 +1020,55 @@ pkg_install() {
     suse)   $SUDO zypper --non-interactive install --no-recommends "$@" ;;
   esac
 }
-install_deps() {
-  detect_family
-  # core: vela itself + building PHP and Postgres. opt: best-effort (MySQL runtime libs).
-  local -a CORE OPT
+deps_lists() {
+  # TOOLS: bin:package, skipped when the bin already exists. BUILD: compiling PHP and addons.
+  # OPT: best-effort (MySQL runtime libs).
   case $FAMILY in
     arch)
-      CORE=(nginx dnsmasq nss git curl base-devel libtool autoconf bison flex re2c pkgconf unzip
-            libxml2 openssl oniguruma libzip icu gd libjpeg-turbo libpng freetype2 libwebp libsodium
-            sqlite postgresql-libs libxslt gmp readline bzip2 perl)
+      TOOLS=(nginx:nginx dnsmasq:dnsmasq certutil:nss git:git curl:curl unzip:unzip)
+      BUILD=(base-devel libtool autoconf bison flex re2c pkgconf
+             libxml2 openssl oniguruma libzip icu gd libjpeg-turbo libpng freetype2 libwebp libsodium
+             sqlite postgresql-libs libxslt gmp readline bzip2 perl)
       OPT=(libaio ncurses) ;;
     debian)
-      CORE=(nginx dnsmasq-base libnss3-tools git curl ca-certificates build-essential libtool autoconf bison
-            flex re2c pkg-config unzip xz-utils libxml2-dev libssl-dev libcurl4-openssl-dev libonig-dev
-            libzip-dev libicu-dev libgd-dev libjpeg-dev libpng-dev libfreetype-dev libwebp-dev libsodium-dev
-            libsqlite3-dev libpq-dev libxslt1-dev libgmp-dev libreadline-dev libbz2-dev zlib1g-dev perl)
+      TOOLS=(nginx:nginx dnsmasq:dnsmasq-base certutil:libnss3-tools git:git curl:curl unzip:unzip xz:xz-utils
+             update-ca-certificates:ca-certificates)
+      BUILD=(build-essential libtool autoconf bison
+             flex re2c pkg-config libxml2-dev libssl-dev libcurl4-openssl-dev libonig-dev
+             libzip-dev libicu-dev libgd-dev libjpeg-dev libpng-dev libfreetype-dev libwebp-dev libsodium-dev
+             libsqlite3-dev libpq-dev libxslt1-dev libgmp-dev libreadline-dev libbz2-dev zlib1g-dev perl)
       OPT=(libaio1t64 libaio1 libncurses6) ;;
     fedora)
-      CORE=(nginx dnsmasq nss-tools git curl gcc gcc-c++ make libtool autoconf automake bison flex re2c
-            pkgconf-pkg-config unzip libxml2-devel openssl-devel libcurl-devel oniguruma-devel libzip-devel
-            libicu-devel gd-devel libjpeg-turbo-devel libpng-devel freetype-devel libwebp-devel
-            libsodium-devel sqlite-devel libpq-devel libxslt-devel gmp-devel readline-devel bzip2-devel
-            zlib-devel perl)
+      TOOLS=(nginx:nginx dnsmasq:dnsmasq certutil:nss-tools git:git curl:curl unzip:unzip)
+      BUILD=(gcc gcc-c++ make libtool autoconf automake bison flex re2c
+             pkgconf-pkg-config libxml2-devel openssl-devel libcurl-devel oniguruma-devel libzip-devel
+             libicu-devel gd-devel libjpeg-turbo-devel libpng-devel freetype-devel libwebp-devel
+             libsodium-devel sqlite-devel libpq-devel libxslt-devel gmp-devel readline-devel bzip2-devel
+             zlib-devel perl)
       OPT=(libaio ncurses-libs) ;;
     suse)
-      CORE=(nginx dnsmasq mozilla-nss-tools git curl gcc gcc-c++ make libtool autoconf automake bison flex re2c
-            pkg-config unzip libxml2-devel libopenssl-devel libcurl-devel oniguruma-devel libzip-devel
-            libicu-devel gd-devel libjpeg8-devel libpng16-devel freetype2-devel libwebp-devel
-            libsodium-devel sqlite3-devel postgresql-devel libxslt-devel gmp-devel readline-devel
-            libbz2-devel zlib-devel perl)
+      TOOLS=(nginx:nginx dnsmasq:dnsmasq certutil:mozilla-nss-tools git:git curl:curl unzip:unzip)
+      BUILD=(gcc gcc-c++ make libtool autoconf automake bison flex re2c
+             pkg-config libxml2-devel libopenssl-devel libcurl-devel oniguruma-devel libzip-devel
+             libicu-devel gd-devel libjpeg8-devel libpng16-devel freetype2-devel libwebp-devel
+             libsodium-devel sqlite3-devel postgresql-devel libxslt-devel gmp-devel readline-devel
+             libbz2-devel zlib-devel perl)
       OPT=(libaio1 ncurses-devel) ;;
   esac
-
-  # RHEL clones ship oniguruma-devel in CRB and re2c/libzip-devel in EPEL
-  if [[ $FAMILY == fedora && $OSID != fedora ]]; then
-    say "enabling EPEL + CRB"
-    $SUDO dnf install -y epel-release dnf-plugins-core || warn "epel-release failed"
-    $SUDO dnf config-manager --set-enabled crb 2>/dev/null || $SUDO dnf config-manager --set-enabled powertools 2>/dev/null || true
-  fi
-  if [[ $FAMILY == debian ]]; then $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update; fi
-
+}
+install_deps() {
+  detect_family
+  deps_lists
   local nginx_was_active=0
   if (( ! DEPS_ONLY )) && systemctl is-active --quiet nginx 2>/dev/null; then nginx_was_active=1; fi
 
-  say "installing packages"
-  pkg_install "${CORE[@]}"
-  local p
-  for p in "${OPT[@]}"; do pkg_install "$p" >/dev/null 2>&1 || warn "optional package '$p' not installed (ignore if unavailable)"; done
-  (( DEPS_ONLY )) && return 0
+  local t found=() want=()
+  for t in "${TOOLS[@]}"; do
+    if find_bin "${t%%:*}" >/dev/null; then found+=("${t%%:*}"); else want+=("${t#*:}"); fi
+  done
+  if (( ${#found[@]} )); then say "already installed, leaving as is: ${found[*]}"; fi
+  if (( ${#want[@]} )); then say "installing packages: ${want[*]}"; pkg_install "${want[@]}"; fi
+  if (( DEPS_ONLY )); then ensure_build_deps; return 0; fi
 
   # vela runs its own user-level nginx on 80/443; a system one must be off
   if systemctl is-active --quiet nginx 2>/dev/null; then
@@ -991,6 +1078,76 @@ install_deps() {
     fi
     $SUDO systemctl disable --now nginx
   fi
+}
+ensure_build_deps() { # toolchain + libs, installed only once something is compiled
+  [[ -f $CONF/build-deps ]] && return 0
+  [[ -n ${FAMILY:-} ]] || detect_family
+  : "${SUDO=sudo}"
+  deps_lists
+  # RHEL clones ship oniguruma-devel in CRB and re2c/libzip-devel in EPEL
+  if [[ $FAMILY == fedora && $OSID != fedora ]]; then
+    say "enabling EPEL + CRB"
+    $SUDO dnf install -y epel-release dnf-plugins-core || warn "epel-release failed"
+    $SUDO dnf config-manager --set-enabled crb 2>/dev/null || $SUDO dnf config-manager --set-enabled powertools 2>/dev/null || true
+  fi
+  say "installing build libraries"
+  pkg_install "${BUILD[@]}"
+  local p
+  for p in "${OPT[@]}"; do pkg_install "$p" >/dev/null 2>&1 || warn "optional package '$p' not installed (ignore if unavailable)"; done
+  mkdir -p "$CONF"; touch "$CONF/build-deps"
+}
+
+# ---- system PHP: distro php-fpm, composer and Laravel's extensions ---------
+sys_pkg() { # ver ext -> distro package providing it ("fpm" and "composer" count as exts here)
+  local v=$1 e=$2
+  case $FAMILY:$e in
+    suse:composer) echo php-composer2 ;;         *:composer) echo composer ;;
+    debian:pdo_sqlite) echo "php$v-sqlite3" ;;   debian:pdo_mysql) echo "php$v-mysql" ;;
+    debian:pdo_pgsql) echo "php$v-pgsql" ;;      debian:dom) echo "php$v-xml" ;;
+    debian:openssl|debian:sodium) echo "php$v-common" ;;
+    debian:*) echo "php$v-$e" ;;
+    fedora:pdo_sqlite) echo php-pdo ;;           fedora:pdo_mysql) echo php-mysqlnd ;;
+    fedora:zip) echo php-pecl-zip ;;             fedora:dom) echo php-xml ;;
+    fedora:openssl|fedora:curl) echo php-common ;;
+    arch:pdo_pgsql|fedora:pdo_pgsql) echo php-pgsql ;;  arch:pdo_sqlite) echo php-sqlite ;;
+    suse:pdo_sqlite) echo php8-sqlite ;;         suse:pdo_mysql) echo php8-mysql ;;
+    suse:pdo_pgsql) echo php8-pgsql ;;           suse:*) echo "php8-$e" ;;
+    *) echo "php-$e" ;;
+  esac
+}
+sys_php_setup() { # ver [ext...] -> offer what the system PHP lacks (default: php-fpm, composer, $PHP_EXTS)
+  local v=$1 e p dir scan loaded miss=() pkgs=() add=() want=()
+  shift
+  if (( $# )); then want=("$@"); else read -r -a want <<<"$PHP_EXTS"; fi
+  [[ -n ${FAMILY:-} ]] || detect_family
+  : "${SUDO=sudo}"
+  sys_fpm "$v" >/dev/null || miss+=(fpm)
+  (( $# )) || have composer || miss+=(composer)
+  dir=$("$SYS_PHP" -r 'echo ini_get("extension_dir");')
+  loaded=$("$SYS_PHP" -m)
+  for e in "${want[@]}"; do grep -qix "$e" <<<"$loaded" || miss+=("$e"); done
+  (( ${#miss[@]} )) || return 0
+  for e in "${miss[@]}"; do
+    [[ -f $dir/$e.so ]] || pkgs+=("$(sys_pkg "$v" "$e")")   # .so already there (Arch): it only needs enabling
+  done
+  if (( ${#pkgs[@]} )); then mapfile -t pkgs < <(printf '%s\n' "${pkgs[@]}" | sort -u); fi
+  say "PHP $v ($SYS_PHP) lacks: ${miss[*]}"
+  ask "Install/enable them now${pkgs[*]:+ (packages: ${pkgs[*]})}?" y || return 1
+  for p in "${pkgs[@]}"; do pkg_install "$p" || warn "could not install $p"; done
+
+  loaded=$("$SYS_PHP" -m)
+  for e in "${want[@]}"; do grep -qix "$e" <<<"$loaded" || [[ ! -f $dir/$e.so ]] || add+=("extension=$e"); done
+  if (( ${#add[@]} )); then
+    # shortcut: writes the CLI scan dir only; Debian splits cli/fpm dirs, but its packages enable themselves
+    scan=$("$SYS_PHP" -r 'echo PHP_CONFIG_FILE_SCAN_DIR;')
+    if [[ -n $scan ]]; then
+      { cat "$scan/vela.ini" 2>/dev/null || true; printf '%s\n' "${add[@]}"; } | sort -u | sys_write "$scan/vela.ini"
+    else warn "PHP $v has no conf.d scan dir; add to php.ini yourself: ${add[*]}"; fi
+  fi
+  loaded=$("$SYS_PHP" -m)
+  for e in "${want[@]}"; do grep -qix "$e" <<<"$loaded" || warn "PHP $v still lacks extension: $e"; done
+  sc try-restart "vela-fpm@$v" 2>/dev/null || true
+  sys_fpm "$v" >/dev/null || { warn "php-fpm for PHP $v is still missing"; return 1; }
 }
 ensure_mise() {
   if ! have mise; then say "installing mise"; curl -fsSL https://mise.run | sh; fi
@@ -1036,6 +1193,17 @@ php_cve_scan() { # warn about already-installed affected versions
   for v in $(mise ls php 2>/dev/null | awk '$1=="php"{print $2}'); do
     why=$(php_cve_status "$v"); [[ -z $why ]] || warn "installed: $why (CVE-2026-109618/109619)"
   done
+  local r; while IFS= read -r r; do ext_cve_warn "$r" || true; done < <(ext_phps)
+}
+ext_cve_warn() { # ext_phps line -> warns and returns 0 when that PHP is affected
+  local mm full src php why to
+  read -r mm full src php _ <<<"$1"
+  [[ -n $full ]] || return 1
+  why=$(php_cve_status "$full"); [[ -n $why ]] || return 1
+  to=$mm; if ver_lt "$mm" 8.2; then to=8.5; fi
+  warn "$why: your $src PHP ($php) is open to CVE-2026-109618/109619 (PHP2Shell, unauthenticated RCE, actively exploited)."
+  if [[ $src == distro ]]; then warn "your distro may have backported the fix without changing the version; check its security tracker."; fi
+  warn "safer: let vela build a patched PHP: vela php:install $to && vela use $to"
 }
 choose_php() { # flag value or "ask" -> PHPS (first = global default)
   PHPS=()
@@ -1081,14 +1249,19 @@ cmd_install() {
   system_setup
 
   say "TLS: mkcert"
-  mise use -g mkcert@latest
+  if have mkcert; then say "mkcert detected, leaving it as is"; else mise use -g mkcert@latest; fi
   mkc -install
 
   mkdir -p "$HOME/Vela"; touch "$CONF/parked"
   grep -qxF "$HOME/Vela" "$CONF/parked" || echo "$HOME/Vela" >>"$CONF/parked"
 
+  local found; found=$(ext_phps | awk '{printf "%s%s (%s, %s)", (NR>1 ? ", " : ""), $2, $3, $4}')
+  if [[ $php == ask && -n $found && -z $(mise_global_php) ]]; then
+    say "PHP found on this machine: $found"
+    if ask "Use it instead of compiling PHP with mise?" y && ext_php_choose; then php=""; fi
+  fi
   choose_php "$php"
-  if (( ${#PHPS[@]} == 0 )); then say "no PHP selected (later: vela php:install 8.5)"; fi
+  if (( ${#PHPS[@]} == 0 )) && [[ -z $(ext_php) ]]; then say "no PHP selected (later: vela php:install 8.5)"; fi
   for v in "${PHPS[@]}"; do
     if [[ -n $(php_prefix "$v") ]]; then say "PHP $v already installed"
     else php_install "$v" || warn "PHP $v not installed"; fi
@@ -1240,7 +1413,7 @@ vela: Herd-like Laravel dev environment (nginx + php-fpm + .test DNS, versions v
 
 sites     park [dir] | forget [dir] | parked | link [name] [--secure] | unlink [name] | links
           sites | secure [name] | unsecure [name] | isolate <ver> [--site=n] | unisolate [--site=n]
-          use <ver> | open [name]
+          use <ver|system> | open [name]
 php       php:install <ver> | php:list (warns on CVE-affected versions) | php:ext <ext> [ver] | xdebug:install [ver] | xdebug:remove [ver]
 addons    service:available | service:add <svc> [ver] [--via native|podman|docker] [--port N] [--user U] [--password P]
           service:list | service:default <id> | service:start|stop|restart <id> | service:remove <id> [--purge] | service:logs <id>
@@ -1269,11 +1442,15 @@ main() {
     sites) cmd_sites ;;          open) cmd_open "$@" ;;
     secure) cmd_secure "$@" ;;   unsecure) cmd_unsecure "$@" ;;
     isolate) cmd_isolate "$@" ;; unisolate) cmd_unisolate "$@" ;;
-    use) [[ ${1:-} =~ ^[0-9]+\.[0-9]+$ ]] || die "usage: vela use <major.minor>"
-         [[ -n $(php_prefix "$1") ]] || php_install "$1"
-         mise use -g "php@$1"; cmd_regen ;;
+    use) if [[ ${1:-} == system ]]; then cmd_use_system; else
+           [[ ${1:-} =~ ^[0-9]+\.[0-9]+$ ]] || die "usage: vela use <major.minor|system>"
+           [[ -n $(php_prefix "$1") ]] || php_install "$1"
+           mise use -g "php@$1"; cmd_regen
+         fi ;;
     php:install) php_install "${1:?usage: vela php:install <ver>}"; cmd_regen ;;
-    php:list) mise ls php; php_cve_scan ;;
+    php:list) mise ls php
+              ext_phps | awk '{printf "%-6s %-10s %-8s %s%s\n", "php", $2, $3, $4, ($5 == "-" ? "  (no php-fpm)" : "")}'
+              php_cve_scan ;;
     php:ext) php_ext_install "${1:?usage: vela php:ext <ext> [ver]}" "${2:-$(global_php)}" ;;
     xdebug:install) cmd_xdebug_install "$@" ;;  xdebug:remove) cmd_xdebug_remove "$@" ;;
     service:available) cmd_svc_available ;;
