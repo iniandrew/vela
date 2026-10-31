@@ -4,6 +4,8 @@ A native, container-free take on Laravel Herd for Linux. nginx + php-fpm + dnsma
 
 Supports systemd distros: Arch family, Debian/Ubuntu, Fedora/RHEL, openSUSE.
 
+WSL is not tested. WSL1 cannot work (no systemd). WSL2 needs `systemd=true` in `/etc/wsl.conf` and manual `.test` DNS setup, see [USAGE.md](USAGE.md#wsl). Windows browsers also need the mkcert CA imported by hand for HTTPS.
+
 ## Install
 
     ./install.sh                      # from a clone

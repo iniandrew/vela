@@ -12,6 +12,7 @@ vela serves your local projects at `https://<name>.test` using nginx, PHP-FPM an
 - [Addons (databases, Redis, search, storage)](#addons-databases-redis-search-storage)
 - [Using addons from Laravel](#using-addons-from-laravel)
 - [Day to day](#day-to-day)
+- [WSL](#wsl)
 - [Troubleshooting](#troubleshooting)
 - [Uninstall](#uninstall)
 - [Where things live](#where-things-live)
@@ -276,6 +277,56 @@ journalctl --user -u 'vela-fpm@*'
 journalctl --user -u vela-dns
 vela service:logs <id>
 ```
+
+## WSL
+
+vela is not tested on WSL. WSL1 cannot run it (no systemd). On WSL2, `.test` needs extra setup: once so WSL itself resolves it, and once more so Windows browsers do.
+
+### Inside WSL
+
+WSL writes its own `/etc/resolv.conf`, which bypasses systemd-resolved, so the `.test` route vela adds is never used. Hand DNS over to systemd-resolved before `vela install` (or rerun `vela install` afterwards):
+
+1. Install systemd-resolved and keep WSL's current DNS server as its upstream. Read the server first, because installing the package can replace `/etc/resolv.conf`:
+
+   ```
+   up=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf)   # WSL's DNS, e.g. 10.255.255.254
+   sudo apt install systemd-resolved                             # Debian/Ubuntu; other distros ship it with systemd
+   sudo mkdir -p /etc/systemd/resolved.conf.d
+   printf '[Resolve]\nDNS=%s\n' "$up" | sudo tee /etc/systemd/resolved.conf.d/wsl.conf
+   sudo systemctl enable --now systemd-resolved
+   sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+   ```
+
+2. Stop WSL from rewriting `/etc/resolv.conf`. `/etc/wsl.conf` should contain:
+
+   ```
+   [boot]
+   systemd=true
+
+   [network]
+   generateResolvConf=false
+   ```
+
+3. Restart WSL: run `wsl --shutdown` in PowerShell, then open your distro again.
+
+4. Run `vela install`, then check that both lookups print an address, `127.0.0.1` for the first:
+
+   ```
+   getent hosts blog.test
+   getent hosts github.com
+   ```
+
+If DNS tunneling is off (older Windows or WSL), WSL's DNS server is the Windows host's address on the WSL network, which can change after a Windows reboot. If outside names stop resolving later, update `DNS=` in `/etc/systemd/resolved.conf.d/wsl.conf` and run `sudo systemctl restart systemd-resolved`.
+
+### From Windows
+
+Windows browsers use Windows DNS, not WSL's, and the Windows hosts file has no wildcards. Add one line per site to `C:\Windows\System32\drivers\etc\hosts` (open your editor as Administrator):
+
+```
+127.0.0.1 blog.test
+```
+
+WSL forwards Windows' `127.0.0.1:80` and `:443` to vela. If a site still does not load, check that nothing on Windows holds port 80: `netstat -ano | findstr :80` in PowerShell.
 
 ## Troubleshooting
 
