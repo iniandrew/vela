@@ -11,6 +11,7 @@ vela serves your local projects at `https://<name>.test` using nginx, PHP-FPM an
 - [Node](#node)
 - [Addons (databases, Redis, search, storage)](#addons-databases-redis-search-storage)
 - [Using addons from Laravel](#using-addons-from-laravel)
+- [Sharing a site](#sharing-a-site)
 - [Day to day](#day-to-day)
 - [WSL](#wsl)
 - [Troubleshooting](#troubleshooting)
@@ -259,6 +260,84 @@ AWS_USE_PATH_STYLE_ENDPOINT=true
 
 Create the database first, for example `createdb -h 127.0.0.1 -U root myapp` (Postgres) or `mysql -h 127.0.0.1 -u root -e 'create database myapp'`. For RustFS use port 9100 in `AWS_ENDPOINT`. Create the bucket from the console (port 9001 for MinIO, 9101 for RustFS).
 
+## Sharing a site
+
+`vela share` gives a site a URL other people can open, through a tunnel. It runs in the foreground; Ctrl+C stops it.
+
+```
+cd ~/Vela/blog && vela share                  # pick the tunnel from a menu
+vela share blog --via cloudflared             # or name it
+vela share blog --via serve --vite            # also share the Vite dev server (HMR)
+```
+
+| `--via` | Who can open it | URL |
+|---|---|---|
+| `cloudflared` | anyone with the link | `https://<random>.trycloudflare.com`, new on every run |
+| `funnel` | anyone with the link | `https://<machine>.<tailnet>.ts.net`, stays the same |
+| `serve` | only devices on your tailnet | `https://<machine>.<tailnet>.ts.net`, stays the same |
+
+### Setting up the tunnel tool
+
+vela prints these steps when the tool is missing.
+
+- **cloudflared** (no account needed): `mise use -g cloudflared` on any distro, `sudo pacman -S cloudflared` on Arch, or Cloudflare's apt/dnf repo at https://pkg.cloudflare.com.
+- **tailscale**, once per machine:
+
+  ```
+  curl -fsSL https://tailscale.com/install.sh | sh
+  sudo systemctl enable --now tailscaled
+  sudo tailscale up
+  sudo tailscale set --operator=$USER     # lets vela run tailscale serve/funnel without sudo
+  ```
+
+  `funnel` (and `serve` over HTTPS) also needs HTTPS certificates and Funnel turned on for your tailnet. On first use tailscale prints a link to the admin console page that does it.
+
+### What to change in the Laravel project
+
+vela prints the changes your project still needs, with the real URL, and leaves your files alone:
+
+1. **`APP_URL`** in `.env`: set it to the tunnel URL. It is used for links built outside a request (mail, queued jobs) and for `Storage::url()`. Put it back when you stop; vela prints the old value. If you ran `php artisan config:cache`, run `php artisan config:clear` after editing.
+2. **Trust the tunnel as a proxy.** The tunnel serves https and talks plain http to vela, so without this Laravel builds `http://` asset URLs and browsers block them as mixed content.
+   - Laravel 11 and newer, in `bootstrap/app.php`:
+
+     ```php
+     ->withMiddleware(function (Middleware $middleware) {
+         $middleware->trustProxies(at: '*');
+     })
+     ```
+
+   - Laravel 10 and older, in `app/Http/Middleware/TrustProxies.php`: `protected $proxies = '*';`
+
+   Trusting every proxy is fine for a dev machine; vela only accepts connections from `127.0.0.1`.
+3. **`SESSION_DOMAIN`**: if it is set (for example to `.blog.test`), set it to `null` while sharing, or logins break.
+
+### Vite
+
+The Vite dev server (`npm run dev`, port 5173) runs on your machine only, so visitors get pages without CSS and JS while it runs. Choose one:
+
+- **Build the assets**: stop `npm run dev` (it deletes `public/hot`) and run `npm run build`. This is the simplest option and always works.
+- **Share the dev server too**, for HMR while you work: `vela share --vite` (or `--vite=5174` for another port; vela also reads the port from `public/hot`, and offers this when `public/hot` exists). The dev server gets its own tunnel: a second trycloudflare URL, or port 8443 on your ts.net name for tailscale. Add this once to `vite.config.js`, inside `defineConfig({...})`. It does nothing unless `VITE_SHARE_URL` is set:
+
+  ```js
+  server: process.env.VITE_SHARE_URL ? (({ hostname, port }) => ({
+      origin: process.env.VITE_SHARE_URL,          // laravel-vite-plugin writes this to public/hot
+      hmr: { clientPort: Number(port || 443) },
+      allowedHosts: [hostname],
+      cors: true,
+  }))(new URL(process.env.VITE_SHARE_URL)) : undefined,
+  ```
+
+  Then restart the dev server with the URL vela prints, for example `VITE_SHARE_URL=https://abc.trycloudflare.com npm run dev`. When you stop sharing, restart it with plain `npm run dev`; until then `blog.test` also loads assets through the dead tunnel. With cloudflared the URL changes on every run, so this restart is needed every time; with tailscale it stays the same.
+
+### Before you share
+
+- With `cloudflared` and `funnel`, anyone who has the link can open the app. With `APP_DEBUG=true` they also see stack traces. Telescope, Horizon and Pulse let every visitor in while `APP_ENV=local`; vela warns when the project uses them.
+- If the site's PHP is affected by PHP2Shell (CVE-2026-109618/109619), vela asks before sharing it. The tunnel removes the `127.0.0.1`-only protection.
+
+### How it works
+
+While a share runs, vela adds a second nginx server for the site on a free `127.0.0.1` port (from 8800 up). It answers any hostname, so the tunnel keeps the public hostname and Laravel builds links with it. The tunnel connects to that port. On exit vela removes that server again. A share that was killed without cleanup is ignored on the next `vela regen`, and is forgotten after a reboot.
+
 ## Day to day
 
 ```
@@ -352,6 +431,12 @@ WSL forwards Windows' `127.0.0.1:80` and `:443` to vela. If a site still does no
 
 **Port already in use when adding an addon.** Choose another: `vela service:add mysql 8.4 --port 3307`.
 
+**`vela share --via cloudflared` stops right away.** vela prints the path of cloudflared's log (`~/.local/state/vela/share-<site>.log`). Quick tunnels do not start when `~/.cloudflared/config.yml` (or `.yaml`) exists; move it aside while sharing.
+
+**`vela share --via serve|funnel`: access denied.** Run `sudo tailscale set --operator=$USER` once. For `funnel`, also turn on HTTPS and Funnel for your tailnet (tailscale prints the link).
+
+**Shared page has no styles, or the console shows mixed content.** Trust the proxy (see [Sharing a site](#sharing-a-site)) and use `npm run build`, or share Vite with `--vite`.
+
 ## Uninstall
 
 ```
@@ -369,5 +454,6 @@ This does not remove mise, the PHP and addon versions it installed, the distro p
 | `~/.config/vela/services/<id>.env` | one addon's settings and credentials (mode 600) |
 | `~/.local/share/vela/data/<id>/` | addon data |
 | `~/.config/systemd/user/vela*` | the systemd user units |
+| `$XDG_RUNTIME_DIR/vela/share/<site>` | port and pid of a running `vela share` (gone after a reboot) |
 | `~/.local/share/mise/installs/` | PHP and addon builds |
 | `/etc/systemd/system/vela-dns-link.service`, `/etc/sysctl.d/99-vela-ports.conf`, `/etc/udev/rules.d/90-vela-nm-unmanaged.rules` | the three system files, removed by `vela uninstall` |
