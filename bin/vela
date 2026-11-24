@@ -179,8 +179,8 @@ load_sites() {
     [[ -d $p ]] && SITE_PATH[${l##*/}]=$p
   done
 }
-site_arg() { # optional name arg -> slug; default is the current dir
-  local n=${1:-}
+site_arg() { # optional name arg (blog or blog.test, as `vela sites` prints it) -> slug; default is the current dir
+  local n=${1,,}; n=${n%".$TLD"}
   if [[ -z $n ]]; then
     local d; d=$(readlink -f "$PWD")
     load_sites
@@ -221,7 +221,7 @@ fastcgi_param REDIRECT_STATUS    200;
 EOF
 }
 render_nginx_conf() { # dir holding sites/
-  local mime=""
+  local mime="" m
   for m in /etc/nginx/mime.types /usr/share/nginx/mime.types /usr/local/etc/nginx/mime.types /usr/local/nginx/conf/mime.types; do
     [[ -f $m ]] && { mime="include $m;"; break; }
   done
@@ -295,6 +295,8 @@ EOF
   else
     printf 'server {\n  listen 127.0.0.1:80;\n  server_name %s;\n%s\n}\n' "$names" "$body"
   fi
+  # vela share: any Host on this port is the site, so the tunnel's public hostname reaches Laravel
+  if [[ -n ${5:-} ]]; then printf 'server {\n  listen 127.0.0.1:%s;\n  server_name _;\n%s\n}\n' "$5" "$body"; fi
 }
 render_path_unit() {
   local d n
@@ -321,7 +323,7 @@ cmd_regen() {
   mkdir -p "$tmp/sites"
   load_sites
   declare -A used=(["$gv"]=1)
-  local n p v sec root
+  local n p v sec root sp spid
   while IFS= read -r n; do
     [[ -n $n ]] || continue
     p=${SITE_PATH[$n]}
@@ -329,7 +331,9 @@ cmd_regen() {
     sec=0; [[ -e $CONF/secure/$n ]] && sec=1
     if (( sec )) && ! ensure_cert "$n"; then warn "certificate for $n failed; serving http"; sec=0; fi
     root=$p; [[ -d $p/public ]] && root=$p/public
-    render_site "$n" "$root" "$RUN/php-$v.sock" "$sec" >"$tmp/sites/$n.conf"
+    sp=""; spid=""; if [[ -f $RUN/share/$n ]]; then read -r sp spid <"$RUN/share/$n" || true; fi
+    if [[ -n $sp ]] && ! kill -0 "${spid:-0}" 2>/dev/null; then sp=""; fi   # vela share died without cleanup
+    render_site "$n" "$root" "$RUN/php-$v.sock" "$sec" "$sp" >"$tmp/sites/$n.conf"
   done < <(printf '%s\n' "${!SITE_PATH[@]}" | sort)
   render_default >"$tmp/sites/00-default.conf"
 
@@ -455,6 +459,218 @@ cmd_sites() {
 }
 cmd_links() { local l; for l in "$CONF"/links/*; do printf '%s -> %s\n' "${l##*/}" "$(readlink "$l")"; done; }
 cmd_open() { local n; n=$(site_arg "${1:-}"); local s=http; [[ -e $CONF/secure/$n ]] && s=https; xdg-open "$s://$n.$TLD"; }
+
+# ---- share: tunnel a site out (cloudflared quick tunnel, tailscale funnel/serve) ----
+SHARE_USAGE="usage: vela share [name] [--via cloudflared|funnel|serve] [--vite[=port]]"
+share_tool() { # via -> path of its binary, or fail
+  case $1 in
+    cloudflared) mise which cloudflared 2>/dev/null || command -v cloudflared ;;
+    funnel|serve) command -v tailscale ;;
+    *) return 1 ;;
+  esac
+}
+share_pick() { # site -> via picked in a menu (rc 1 without a tty)
+  local -a vias=(cloudflared funnel serve) labels=(
+    "cloudflared       public URL, no account (new random URL each run)"
+    "tailscale funnel  public URL on your ts.net name"
+    "tailscale serve   only devices on your tailnet")
+  local i
+  for i in "${!vias[@]}"; do share_tool "${vias[i]}" >/dev/null || labels[i]+="  (not installed)"; done
+  menu one "Share $1 with" "${labels[@]}" || return 1
+  echo "${vias[MENU_SEL]}"
+}
+share_ready() { # via -> 0 when its tool is usable, else prints how to set it up
+  if [[ $1 == cloudflared ]]; then
+    share_tool cloudflared >/dev/null && return 0
+    warn "cloudflared is not installed. Install it with one of:"
+    printf '  %s\n' "mise use -g cloudflared      (any distro)" "sudo pacman -S cloudflared   (Arch)" \
+      "https://pkg.cloudflare.com   (apt/dnf repo for Debian, Ubuntu, Fedora, RHEL)"
+    echo "then rerun: vela share --via cloudflared"
+    return 1
+  fi
+  if ! share_tool "$1" >/dev/null; then
+    warn "tailscale is not installed. Set it up once:"
+    printf '  %s\n' "curl -fsSL https://tailscale.com/install.sh | sh" "sudo systemctl enable --now tailscaled" \
+      "sudo tailscale up" "sudo tailscale set --operator=\$USER   (lets vela run tailscale $1 without sudo)"
+    if [[ $1 == funnel ]]; then echo "funnel also needs HTTPS and Funnel enabled for your tailnet; tailscale prints the link on first use"; fi
+    return 1
+  fi
+  tailscale status >/dev/null 2>&1 && return 0
+  warn "tailscale is not connected. Run: sudo systemctl enable --now tailscaled && sudo tailscale up"
+  return 1
+}
+share_cve_ok() { # site dir -> 0 to proceed; a tunnel lifts the 127.0.0.1-only protection PHP2Shell warnings rely on
+  local v p full="" why=""
+  v=$(site_php "$1"); p=$(php_prefix "$v")
+  if [[ -n $p ]]; then
+    full=$("$p/bin/php" -r 'echo PHP_VERSION;' 2>/dev/null) || full=""
+    if [[ -n $full ]]; then why=$(php_cve_status "$full"); fi
+    if [[ -n $why ]]; then warn "$why (CVE-2026-109618/109619, PHP2Shell, unauthenticated RCE)"; fi
+  elif ext_cve_warn "$(ext_rec "$v")"; then why=1; fi
+  [[ -z $why ]] || ask "A tunnel exposes this PHP to other machines. Share anyway?" n
+}
+share_env() { [[ -f $1/.env ]] || return 0; sed -n "s/^$2=//p" "$1/.env" | tail -n1 | tr -d "\"'"; }   # dir key -> .env value
+share_env_set() { # dir key value: set KEY in .env (appended when missing) and record the checksum; the app and vite watchers write at once, hence the lock
+  local f=$1/.env
+  {
+    flock 8
+    if grep -q "^$2=" "$f"; then sed -i "s|^$2=.*|$2=$3|" "$f"
+    else [[ -z $(tail -c1 "$f") ]] || echo >>"$f"; printf '%s=%s\n' "$2" "$3" >>"$f"; fi
+    cksum <"$f" >"$SHARE_SUM"
+  } 8>"$SHARE_SUM.lock"
+}
+share_hints() { # app|vite dir url
+  local d=$2 u=$3 v h
+  local -a cfgs=("$d"/vite.config.*)
+  if [[ $1 == vite ]]; then
+    say "vite dev server: $u"
+    if ! { (( ${#cfgs[@]} )) && grep -qs "VITE_SHARE_'" "${cfgs[@]}"; }; then
+      echo "  once, add to vite.config.js:"
+      cat <<'EOF'
+    // at the top, in place of the vite import
+    import { defineConfig, loadEnv } from 'vite';
+    const share = loadEnv('', process.cwd(), 'VITE_SHARE_').VITE_SHARE_URL;   // set in .env by vela share --vite
+
+    // inside defineConfig({...})
+    server: share ? (({ hostname, port }) => ({
+        origin: share,
+        hmr: { clientPort: Number(port || 443) },
+        allowedHosts: [hostname],
+        cors: true,
+    }))(new URL(share)) : undefined,
+EOF
+    fi
+    if [[ -n ${SHARE_SUM:-} ]]; then
+      share_env_set "$d" VITE_SHARE_URL "$u"
+      echo "  .env: VITE_SHARE_URL=$u   (set by vela; a running npm run dev restarts itself and picks it up)"
+    else echo "  restart the dev server with: VITE_SHARE_URL=$u npm run dev"; fi
+    return 0
+  fi
+  say "shared: $u   (Ctrl+C stops)"
+  [[ -f $d/artisan ]] || return 0
+  echo "  Laravel changes while sharing:"
+  if [[ -n ${SHARE_SUM:-} ]]; then
+    v=$(share_env "$d" APP_URL); share_env_set "$d" APP_URL "$u"
+    echo "  - .env: APP_URL=$u   (set by vela, was ${v:-unset}; .env is put back when sharing stops)"
+    h=${v#*://}; h=${h%%/*}
+    v=$(share_env "$d" SANCTUM_STATEFUL_DOMAINS)
+    if [[ -n $v || -f $d/config/sanctum.php ]]; then   # Sanctum gives API calls the session only from these hosts; a published config may not add APP_URL's
+      share_env_set "$d" SANCTUM_STATEFUL_DOMAINS "${v:-localhost,localhost:3000,127.0.0.1,127.0.0.1:8000,::1${h:+,$h}},${u#https://}"
+      echo "  - .env: SANCTUM_STATEFUL_DOMAINS gets ${u#https://}   (set by vela; otherwise API calls are Unauthenticated)"
+    fi
+    v=$(share_env "$d" SESSION_DOMAIN)
+    if [[ -n $v && $v != null ]]; then share_env_set "$d" SESSION_DOMAIN null; echo "  - .env: SESSION_DOMAIN=null   (set by vela, was $v; its cookies never reach $u)"; fi
+  else echo "  - .env: APP_URL=$u"; fi
+  if [[ -f $d/bootstrap/cache/config.php ]]; then echo "  - config is cached, so Laravel ignores .env: run php artisan config:clear"; fi
+  if [[ -f $d/bootstrap/app.php ]] && grep -q withMiddleware "$d/bootstrap/app.php"; then
+    if ! grep -q trustProxies "$d/bootstrap/app.php"; then
+      echo "  - bootstrap/app.php, inside ->withMiddleware(function (Middleware \$middleware) { ... }):"
+      echo "      \$middleware->trustProxies(at: '*');   (otherwise assets load over http and browsers block them)"
+    fi
+  elif [[ -f $d/app/Http/Middleware/TrustProxies.php ]]; then
+    if ! grep -Eq "proxies *= *['\"]\*['\"]" "$d/app/Http/Middleware/TrustProxies.php"; then
+      echo "  - app/Http/Middleware/TrustProxies.php: protected \$proxies = '*';   (otherwise assets load over http)"
+    fi
+  fi
+  if [[ -z ${SHARE_VITE:-} && -f $d/public/hot ]]; then
+    echo "  - npm run dev is running (public/hot): visitors cannot reach it. Stop it and run npm run build, or rerun with --vite"
+  elif [[ -z ${SHARE_VITE:-} && ! -f $d/public/build/manifest.json ]] && grep -qs '"vite"' "$d/package.json"; then
+    echo "  - no Vite build yet: run npm run build"
+  fi
+}
+share_watch() { # app|vite dir log: cloudflared's log on stdin -> errors, and the hints once the URL shows up
+  local l out seen=0
+  while IFS= read -r l; do
+    printf '%s\n' "$l" >>"$3"
+    if [[ $l == *" ERR "* ]]; then printf '%s\n' "$l" >&2
+    elif (( ! seen )) && [[ $l =~ https://[a-z0-9-]+\.trycloudflare\.com ]]; then
+      seen=1; out=$(share_hints "$1" "$2" "${BASH_REMATCH[0]}" 2>&1) || true
+      printf '%s\n' "$out"   # one write, so the app and vite watchers do not interleave
+    fi
+  done
+}
+cmd_share() {
+  local via="" vite=0 vport="" name="" n dir marker pid="" port=8800 host="" bak="" cf log rc=0 start vpid=""
+  while (( $# )); do
+    case $1 in
+      --via)    (( $# > 1 )) || die "$SHARE_USAGE"; via=$2; shift ;;
+      --via=*)  via=${1#--via=} ;;
+      --vite)   vite=1 ;;
+      --vite=*) vite=1; vport=${1#--vite=} ;;
+      -*) die "$SHARE_USAGE" ;;
+      *) name=$1 ;;
+    esac
+    shift
+  done
+  n=$(site_arg "$name"); require_site "$n"; dir=${SITE_PATH[$n]}
+  sc is-active --quiet vela-nginx || die "vela is not running; run: vela start"
+  marker=$RUN/share/$n
+  if [[ -f $marker ]]; then read -r _ pid <"$marker" || true; fi
+  if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then die "$n is already shared (pid $pid)"; fi
+  if [[ -f $dir/artisan && -f $dir/.env ]]; then   # vela points .env at the tunnel and restores it from here
+    bak=$dir/.env.backup
+    [[ ! -e $bak ]] || die "$bak exists, maybe left by a vela share that was killed. Put it back (mv .env.backup .env) or delete it, then rerun"
+  fi
+  if [[ -z $via ]]; then via=$(share_pick "$n") || die "$SHARE_USAGE"; fi
+  case $via in cloudflared|funnel|serve) ;; *) die "--via must be cloudflared, funnel or serve" ;; esac
+  share_ready "$via" || exit 1
+  share_cve_ok "$dir" || die "not shared"
+  if [[ $via != cloudflared ]]; then
+    host=$(tailscale status --json --peers=false | sed -n 's/.*"DNSName": *"\([^"]*\)\.".*/\1/p' | head -n1)
+    [[ -n $host ]] || die "tailscale did not report this machine's name; is MagicDNS on?"
+  fi
+  if (( ! vite )) && [[ -t 0 && -f $dir/public/hot ]] && ask "npm run dev is running for $n. Share the Vite dev server too?" y; then vite=1; fi
+  if (( vite )) && [[ -z $vport ]]; then
+    vport=5173   # else the port in public/hot, when it points at this machine
+    if [[ -f $dir/public/hot && $(<"$dir/public/hot") =~ ^https?://(localhost|127\.0\.0\.1|\[::1\]):([0-9]+) ]]; then vport=${BASH_REMATCH[2]}; fi
+  fi
+  [[ -z $vport || $vport =~ ^[0-9]+$ ]] || die "--vite port must be a number"
+  SHARE_VITE=$vport
+  if [[ $via != serve ]]; then warn "anyone with the link can open $n; with APP_DEBUG=true they also see stack traces"; fi
+  if grep -Eqs '"laravel/(telescope|horizon|pulse)"' "$dir/composer.json"; then
+    warn "Telescope, Horizon and Pulse dashboards are open to every visitor while APP_ENV=local"
+  fi
+  while ! svc_port_free "$port"; do port=$((port+1)); done
+  mkdir -p "$RUN/share" "$STATE"; echo "$port $$" >"$marker"
+  cmd_regen --quiet
+  if [[ -n $bak ]]; then SHARE_SUM=$RUN/share/$n.sum; cp -p "$dir/.env" "$bak"; cksum <"$dir/.env" >"$SHARE_SUM"; fi
+
+  trap : INT TERM HUP   # Ctrl+C ends the tunnel, not vela, so the cleanup below still runs
+  start=$SECONDS
+  if [[ $via == cloudflared ]]; then
+    cf=$(share_tool cloudflared); log=$STATE/share-$n.log; : >"$log"
+    if [[ -n $vport ]]; then
+      "$cf" tunnel --no-autoupdate --url "http://localhost:$vport" --http-host-header localhost \
+        2> >(share_watch vite "$dir" "$log") &
+      vpid=$!
+    fi
+    "$cf" tunnel --no-autoupdate --url "http://127.0.0.1:$port" 2> >(share_watch app "$dir" "$log") || rc=$?
+  else
+    share_hints app "$dir" "https://$host"
+    if [[ -n $vport ]]; then
+      share_hints vite "$dir" "https://$host:8443"
+      tailscale "$via" --https=8443 "http://localhost:$vport" & vpid=$!
+    fi
+    tailscale "$via" "http://127.0.0.1:$port" || rc=$?
+  fi
+  if [[ -n $vpid ]]; then kill "$vpid" 2>/dev/null || true; wait "$vpid" 2>/dev/null || true; fi
+  if [[ -n $bak ]]; then   # restore before any output: after a closed terminal, writing could fail
+    if [[ $(cksum <"$dir/.env") == "$(<"$SHARE_SUM")" ]]; then mv -f "$bak" "$dir/.env"; bak=""
+    else warn ".env changed while sharing, so vela left it as is. The .env from before sharing is in $bak"; fi
+    rm -f "$SHARE_SUM" "$SHARE_SUM.lock"
+  fi
+  rm -f "$marker"
+  trap - INT TERM HUP
+  cmd_regen --quiet
+
+  if (( rc && rc != 130 && SECONDS - start < 10 )); then   # 130: Ctrl+C
+    if [[ $via == cloudflared ]]; then warn "cloudflared stopped early; its log: $log"
+    else warn "tailscale $via failed. If it said access denied: sudo tailscale set --operator=\$USER. funnel also needs HTTPS and Funnel enabled for your tailnet"; fi
+  fi
+  say "stopped sharing $n"
+  if [[ -n ${SHARE_SUM:-} && -z $bak ]]; then echo "  .env restored"; fi
+  if [[ -n $vport && -z ${SHARE_SUM:-} ]]; then echo "  restart the dev server without VITE_SHARE_URL: npm run dev"; fi
+}
 
 # ---- PECL extensions (phpredis for the Redis addon) ------------------------
 php_ext_install() { # ext ver -> installs via pecl and enables it in conf.d/<ext>.ini
@@ -1413,7 +1629,7 @@ vela: Herd-like Laravel dev environment (nginx + php-fpm + .test DNS, versions v
 
 sites     park [dir] | forget [dir] | parked | link [name] [--secure] | unlink [name] | links
           sites | secure [name] | unsecure [name] | isolate <ver> [--site=n] | unisolate [--site=n]
-          use <ver|system> | open [name]
+          use <ver|system> | open [name] | share [name] [--via cloudflared|funnel|serve] [--vite[=port]]
 php       php:install <ver> | php:list (warns on CVE-affected versions) | php:ext <ext> [ver] | xdebug:install [ver] | xdebug:remove [ver]
 addons    service:available | service:add <svc> [ver] [--via native|podman|docker] [--port N] [--user U] [--password P]
           service:list | service:default <id> | service:start|stop|restart <id> | service:remove <id> [--purge] | service:logs <id>
@@ -1439,7 +1655,7 @@ main() {
     park) cmd_park "$@" ;;       forget) cmd_forget "$@" ;;
     parked) parked_dirs ;;
     link) cmd_link "$@" ;;       unlink) cmd_unlink "$@" ;;      links) cmd_links ;;
-    sites) cmd_sites ;;          open) cmd_open "$@" ;;
+    sites) cmd_sites ;;          open) cmd_open "$@" ;;          share) cmd_share "$@" ;;
     secure) cmd_secure "$@" ;;   unsecure) cmd_unsecure "$@" ;;
     isolate) cmd_isolate "$@" ;; unisolate) cmd_unisolate "$@" ;;
     use) if [[ ${1:-} == system ]]; then cmd_use_system; else

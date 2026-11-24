@@ -26,6 +26,7 @@ Full guide: [USAGE.md](USAGE.md).
     cd ~/code/app && vela link        # http://app.test
     vela secure app                   # https via mkcert
     vela isolate 8.4 --site=app       # per-site PHP (writes mise.local.toml)
+    vela share app                    # public URL via cloudflared or tailscale, prints the Laravel/Vite changes
     vela sites
 
 Run `vela help` for the full list.
