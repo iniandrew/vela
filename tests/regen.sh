@@ -77,7 +77,10 @@ cat >"$T/bin/cloudflared" <<'STUB'
 #!/usr/bin/env bash
 case $* in
   *localhost:5173*) echo "2026-11-24T00:00:00Z INF |  https://vite-x.trycloudflare.com  |" >&2; exec sleep 5 ;;
-  *) sleep 0.3; echo "2026-11-24T00:00:00Z INF |  https://app-x.trycloudflare.com  |" >&2; sleep 1 ;;
+  *) sleep 0.3; echo "2026-11-24T00:00:00Z INF |  https://app-x.trycloudflare.com  |" >&2; sleep 0.5
+     cp "$STUB_ENV" "$STUB_ENV.during"   # .env as vela left it while sharing
+     if [[ ${STUB_EDIT:-0} == 1 ]]; then echo X=1 >>"$STUB_ENV"; fi
+     sleep 0.5 ;;
 esac
 STUB
 chmod +x "$T/bin/cloudflared"
@@ -87,13 +90,27 @@ return Application::configure()
     ->withMiddleware(function ($middleware) {})
     ->create();
 ' >"$T/parked/b/bootstrap/app.php"
-printf 'APP_URL=http://b.test
-' >"$T/parked/b/.env"; printf 'http://[::1]:5173' >"$T/parked/b/public/hot"
+printf 'APP_URL=http://b.test\nSESSION_DOMAIN=.b.test\n' >"$T/parked/b/.env"; printf 'http://[::1]:5173' >"$T/parked/b/public/hot"
+mkdir -p "$T/parked/b/config"; echo '<?php return [];' >"$T/parked/b/config/sanctum.php"
+export STUB_ENV=$T/parked/b/.env; cp "$STUB_ENV" "$T/env.orig"
 out=$(STUB_UP=1 "$VELA" share b --via cloudflared --vite 2>&1)
-for want in 'APP_URL=https://app-x.trycloudflare.com' 'trustProxies' 'allowedHosts' \
-            'VITE_SHARE_URL=https://vite-x.trycloudflare.com npm run dev' 'APP_URL=http://b.test'; do
+for want in 'APP_URL=https://app-x.trycloudflare.com' 'trustProxies' 'allowedHosts' 'loadEnv' 'was http://b.test' '.env restored'; do
   [[ $out == *"$want"* ]] || fail "share output lacks '$want': $out"
 done
+for want in 'APP_URL=https://app-x.trycloudflare.com' 'VITE_SHARE_URL=https://vite-x.trycloudflare.com' 'SESSION_DOMAIN=null' \
+            'SANCTUM_STATEFUL_DOMAINS=localhost,localhost:3000,127.0.0.1,127.0.0.1:8000,::1,b.test,app-x.trycloudflare.com'; do
+  has "$STUB_ENV.during" "$want"
+done
+cmp -s "$STUB_ENV" "$T/env.orig" || fail "share did not restore .env: $(cat "$STUB_ENV")"
+[[ ! -e $T/parked/b/.env.backup ]] || fail "share left .env.backup"
+# .env edited while sharing: vela keeps it and leaves the original in .env.backup; the next share refuses
+out=$(STUB_UP=1 STUB_EDIT=1 "$VELA" share b --via cloudflared 2>&1 </dev/null)
+[[ $out == *"changed while sharing"* ]] || fail "share did not warn about the edited .env: $out"
+has "$STUB_ENV" 'X=1'
+cmp -s "$T/parked/b/.env.backup" "$T/env.orig" || fail ".env.backup is not the original .env"
+err=$(STUB_UP=1 "$VELA" share b --via cloudflared 2>&1 </dev/null) && fail "share overwrote .env.backup"
+[[ $err == *".env.backup exists"* ]] || fail "share does not explain the leftover .env.backup: $err"
+mv "$T/parked/b/.env.backup" "$STUB_ENV"
 [[ ! -e $T/run/vela/share/b ]] || fail "share left its marker"
 ! grep -q 'server_name _' "$C/nginx/sites/b.conf" || fail "share left its nginx server"
 err=$("$VELA" share b 2>&1 </dev/null) && fail "share ran without a tunnel choice"

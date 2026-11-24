@@ -294,10 +294,19 @@ vela prints these steps when the tool is missing.
 
 ### What to change in the Laravel project
 
-vela prints the changes your project still needs, with the real URL, and leaves your files alone:
+While a share runs, vela edits `.env` for you and puts it back when you stop:
 
-1. **`APP_URL`** in `.env`: set it to the tunnel URL. It is used for links built outside a request (mail, queued jobs) and for `Storage::url()`. Put it back when you stop; vela prints the old value. If you ran `php artisan config:cache`, run `php artisan config:clear` after editing.
-2. **Trust the tunnel as a proxy.** The tunnel serves https and talks plain http to vela, so without this Laravel builds `http://` asset URLs and browsers block them as mixed content.
+- It copies `.env` to `.env.backup` (Laravel's default `.gitignore` already ignores that file).
+- It sets **`APP_URL`** to the tunnel URL. Laravel uses it for links built outside a request (mail, queued jobs) and for `Storage::url()`. laravel-vite-plugin also accepts requests from that origin (CORS).
+- If **`SESSION_DOMAIN`** is set (for example to `.blog.test`), vela sets it to `null`. Otherwise logins break.
+- If the project uses Sanctum (`SANCTUM_STATEFUL_DOMAINS` is in `.env`, or `config/sanctum.php` exists), vela adds the tunnel host to **`SANCTUM_STATEFUL_DOMAINS`**. Without it, Axios calls from the shared page get no session and return `Unauthenticated`. When the key is not in `.env`, vela writes Laravel's default list plus the site's old host and the tunnel host.
+- With `--vite`, it sets **`VITE_SHARE_URL`** (see [Vite](#vite)).
+
+When you stop, vela moves `.env.backup` back over `.env`. If you edited `.env` while sharing, vela keeps your edited `.env` and leaves the original in `.env.backup` for you to merge. While `.env.backup` exists, `vela share` refuses to start. If you ran `php artisan config:cache`, Laravel ignores `.env`; run `php artisan config:clear`.
+
+One change is still yours to make, and vela prints it when it is missing:
+
+1. **Trust the tunnel as a proxy.** The tunnel serves https and talks plain http to vela, so without this Laravel builds `http://` asset URLs and browsers block them as mixed content.
    - Laravel 11 and newer, in `bootstrap/app.php`:
 
      ```php
@@ -309,25 +318,29 @@ vela prints the changes your project still needs, with the real URL, and leaves 
    - Laravel 10 and older, in `app/Http/Middleware/TrustProxies.php`: `protected $proxies = '*';`
 
    Trusting every proxy is fine for a dev machine; vela only accepts connections from `127.0.0.1`.
-3. **`SESSION_DOMAIN`**: if it is set (for example to `.blog.test`), set it to `null` while sharing, or logins break.
 
 ### Vite
 
 The Vite dev server (`npm run dev`, port 5173) runs on your machine only, so visitors get pages without CSS and JS while it runs. Choose one:
 
 - **Build the assets**: stop `npm run dev` (it deletes `public/hot`) and run `npm run build`. This is the simplest option and always works.
-- **Share the dev server too**, for HMR while you work: `vela share --vite` (or `--vite=5174` for another port; vela also reads the port from `public/hot`, and offers this when `public/hot` exists). The dev server gets its own tunnel: a second trycloudflare URL, or port 8443 on your ts.net name for tailscale. Add this once to `vite.config.js`, inside `defineConfig({...})`. It does nothing unless `VITE_SHARE_URL` is set:
+- **Share the dev server too**, for HMR while you work: `vela share --vite` (or `--vite=5174` for another port; vela also reads the port from `public/hot`, and offers this when `public/hot` exists). The dev server gets its own tunnel: a second trycloudflare URL, or port 8443 on your ts.net name for tailscale. Add this once to `vite.config.js`. It does nothing unless `VITE_SHARE_URL` is set:
 
   ```js
-  server: process.env.VITE_SHARE_URL ? (({ hostname, port }) => ({
-      origin: process.env.VITE_SHARE_URL,          // laravel-vite-plugin writes this to public/hot
+  // at the top, in place of the vite import
+  import { defineConfig, loadEnv } from 'vite';
+  const share = loadEnv('', process.cwd(), 'VITE_SHARE_').VITE_SHARE_URL;   // set in .env by vela share --vite
+
+  // inside defineConfig({...})
+  server: share ? (({ hostname, port }) => ({
+      origin: share,          // laravel-vite-plugin writes this to public/hot
       hmr: { clientPort: Number(port || 443) },
       allowedHosts: [hostname],
       cors: true,
-  }))(new URL(process.env.VITE_SHARE_URL)) : undefined,
+  }))(new URL(share)) : undefined,
   ```
 
-  Then restart the dev server with the URL vela prints, for example `VITE_SHARE_URL=https://abc.trycloudflare.com npm run dev`. When you stop sharing, restart it with plain `npm run dev`; until then `blog.test` also loads assets through the dead tunnel. With cloudflared the URL changes on every run, so this restart is needed every time; with tailscale it stays the same.
+  vela writes `VITE_SHARE_URL` to `.env`. Vite restarts its dev server when `.env` changes, so a running `npm run dev` switches to the tunnel by itself. When you stop sharing, vela restores `.env` and the dev server switches back. If `npm run dev` is not running, start it. Setting `VITE_SHARE_URL` in the shell (`VITE_SHARE_URL=https://abc.trycloudflare.com npm run dev`) also works, for a site without `.env`.
 
 ### Before you share
 
@@ -434,6 +447,8 @@ WSL forwards Windows' `127.0.0.1:80` and `:443` to vela. If a site still does no
 **`vela share --via cloudflared` stops right away.** vela prints the path of cloudflared's log (`~/.local/state/vela/share-<site>.log`). Quick tunnels do not start when `~/.cloudflared/config.yml` (or `.yaml`) exists; move it aside while sharing.
 
 **`vela share --via serve|funnel`: access denied.** Run `sudo tailscale set --operator=$USER` once. For `funnel`, also turn on HTTPS and Funnel for your tailnet (tailscale prints the link).
+
+**`vela share`: `.env.backup` exists.** A share was killed before it could restore `.env`, or you edited `.env` while sharing. Compare the two files. Then put the original back with `mv .env.backup .env`, or delete `.env.backup`.
 
 **Shared page has no styles, or the console shows mixed content.** Trust the proxy (see [Sharing a site](#sharing-a-site)) and use `npm run build`, or share Vite with `--vite`.
 
